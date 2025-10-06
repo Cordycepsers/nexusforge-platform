@@ -1,4 +1,89 @@
-I need you to help me create a complete GitHub repository for the NexusForge Platform based on the following structure and requirements. Please generate ALL files with complete, production-ready code.
+```
+Please review the complete NexusForge Platform repository and verify:
+
+1. **Completeness Check**:
+   - All files from the structure are generated
+   - No placeholder or TODO comments remain
+   - All dependencies are properly declared
+
+2. **Consistency Check**:
+   - Naming conventions are consistent
+   - Configuration values match across files
+   - Environment variables are consistent
+   - Version numbers are aligned
+
+3. **Security Check**:
+   - No hardcoded credentials
+   - All secrets use Secret Manager
+   - Proper IAM roles assigned
+   - Security scanning is enabled
+
+4. **Integration Check**:
+   - GitHub Actions reference correct paths
+   - Docker Compose services are properly linked
+   - Scripts reference correct variables
+   - Documentation matches implementation
+
+5. **Quality Check**:
+   - All scripts have error handling
+   - Code follows best practices
+   - Tests provide adequate coverage
+   - Documentation is comprehensive
+
+Generate a checklist report showing status of each check.
+```
+
+---
+
+## 🎨 Customization Prompts
+
+### To Change Team Name:
+```
+Replace all instances of "nexusforge" with "[YOUR_TEAM_NAME]" throughout the repository, including:
+- Project IDs
+- Resource names
+- Environment variables
+- Documentation
+- Script variables
+
+Maintain the same naming conventions (lowercase, hyphens for resources).
+```
+
+### To Add a New Language:
+```
+Add support for [LANGUAGE] to the NexusForge platform:
+
+1. Create workspace/[language]/ directory with proper project structure
+2. Add Dockerfile in config/docker/Dockerfile.[language]
+3. Update GitHub Actions workflows to include [language]
+4. Add to docker-compose-all-in-one.yml
+5. Update documentation
+6. Generate sample application with health checks
+
+Follow the same patterns as existing languages (Python, Node.js, Go).
+```
+
+### To Add a New Service:
+```
+Add a new service called "[SERVICE_NAME]" to the platform:
+
+1. Create workspace/[language]/[service]/ directory
+2. Generate application code with:
+   - Health check endpoint
+   - Prometheus metrics
+   - Database integration
+   - Tests
+3. Add Dockerfile for the service
+4. Update docker-compose files
+5. Add to CI/CD workflows
+6. Generate documentation
+
+Use [LANGUAGE] and follow existing patterns.
+```
+
+---
+
+This prompt structure will help you build the complete repository systematically with AI assistance, ensuring quality, consistency, and completeness throughout the process.
 
 ## Project Overview
 NexusForge is a fully automated, secure, and scalable development platform on Google Cloud Platform (GCP) that supports Python 3.9, Node.js 16, and Go 1.18 development environments with integrated CI/CD, monitoring, and security features.
