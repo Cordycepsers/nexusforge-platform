@@ -1,0 +1,469 @@
+# ============================================
+# NexusForge Platform - RBAC Policies
+# ============================================
+# Role-Based Access Control policies for GCP and application-level permissions
+# ============================================
+
+# ============================================
+# GCP IAM Roles and Bindings
+# ============================================
+gcp_iam:
+  # ==========================================
+  # Project-level roles
+  # ==========================================
+  project_roles:
+    # Owners - Full access (minimize this list)
+    - role: roles/owner
+      members:
+        - user:admin@example.com
+      description: "Full project ownership - emergency access only"
+    
+    # Editors - Broad permissions (use sparingly)
+    - role: roles/editor
+      members:
+        - group:platform-admins@example.com
+      description: "Project editors for infrastructure management"
+    
+    # Viewers - Read-only access
+    - role: roles/viewer
+      members:
+        - group:developers@example.com
+        - group:support@example.com
+      description: "Read-only access to project resources"
+
+  # ==========================================
+  # Service-specific IAM roles
+  # ==========================================
+  service_accounts:
+    # GitHub Actions Service Account
+    - name: github-actions-sa
+      email: nexusforge-github-actions@PROJECT_ID.iam.gserviceaccount.com
+      display_name: "GitHub Actions Deployment Service Account"
+      description: "Used by GitHub Actions workflows for CI/CD"
+      roles:
+        - roles/run.admin                    # Deploy Cloud Run services
+        - roles/iam.serviceAccountUser       # Act as service accounts
+        - roles/artifactregistry.writer      # Push container images
+        - roles/cloudbuild.builds.editor     # Manage Cloud Build
+        - roles/compute.admin                # Manage VMs
+        - roles/cloudsql.admin               # Manage Cloud SQL
+        - roles/secretmanager.secretAccessor # Access secrets
+        - roles/storage.admin                # Manage Cloud Storage
+        - roles/logging.logWriter            # Write logs
+        - roles/monitoring.metricWriter      # Write metrics
+    
+    # Development Environment Service Account
+    - name: dev-service-account
+      email: nexusforge-dev@PROJECT_ID.iam.gserviceaccount.com
+      display_name: "Development Services Account"
+      description: "Service account for dev environment services"
+      roles:
+        - roles/cloudsql.client              # Connect to Cloud SQL
+        - roles/redis.editor                 # Access Redis
+        - roles/secretmanager.secretAccessor # Read secrets
+        - roles/storage.objectViewer         # Read from storage
+        - roles/logging.logWriter            # Write logs
+        - roles/monitoring.metricWriter      # Write metrics
+        - roles/cloudtrace.agent             # Write traces
+    
+    # Staging Environment Service Account
+    - name: staging-service-account
+      email: nexusforge-staging@PROJECT_ID.iam.gserviceaccount.com
+      display_name: "Staging Services Account"
+      description: "Service account for staging environment services"
+      roles:
+        - roles/cloudsql.client              # Connect to Cloud SQL
+        - roles/redis.editor                 # Access Redis
+        - roles/secretmanager.secretAccessor # Read secrets
+        - roles/storage.objectViewer         # Read from storage
+        - roles/logging.logWriter            # Write logs
+        - roles/monitoring.metricWriter      # Write metrics
+        - roles/cloudtrace.agent             # Write traces
+    
+    # Production Environment Service Account
+    - name: prod-service-account
+      email: nexusforge-prod@PROJECT_ID.iam.gserviceaccount.com
+      display_name: "Production Services Account"
+      description: "Service account for production environment services"
+      roles:
+        - roles/cloudsql.client              # Connect to Cloud SQL
+        - roles/redis.editor                 # Access Redis
+        - roles/secretmanager.secretAccessor # Read secrets
+        - roles/storage.objectViewer         # Read from storage
+        - roles/logging.logWriter            # Write logs
+        - roles/monitoring.metricWriter      # Write metrics
+        - roles/cloudtrace.agent             # Write traces
+        - roles/cloudprofiler.agent          # Performance profiling
+
+  # ==========================================
+  # Cloud Run IAM policies
+  # ==========================================
+  cloud_run:
+    # Public access (if needed)
+    - service: nexusforge-python-prod
+      role: roles/run.invoker
+      members:
+        - allUsers  # WARNING: Public access - use with caution
+      condition: null
+    
+    # Internal service-to-service communication
+    - service: nexusforge-*-dev
+      role: roles/run.invoker
+      members:
+        - serviceAccount:nexusforge-dev@PROJECT_ID.iam.gserviceaccount.com
+      condition: null
+    
+    - service: nexusforge-*-staging
+      role: roles/run.invoker
+      members:
+        - serviceAccount:nexusforge-staging@PROJECT_ID.iam.gserviceaccount.com
+      condition: null
+    
+    - service: nexusforge-*-prod
+      role: roles/run.invoker
+      members:
+        - serviceAccount:nexusforge-prod@PROJECT_ID.iam.gserviceaccount.com
+      condition:
+        title: "Production hours only"
+        expression: "request.time.getHours('America/New_York') >= 6 && request.time.getHours('America/New_York') <= 23"
+
+  # ==========================================
+  # Secret Manager IAM policies
+  # ==========================================
+  secret_manager:
+    # Development secrets
+    - secret: dev-*
+      role: roles/secretmanager.secretAccessor
+      members:
+        - serviceAccount:nexusforge-dev@PROJECT_ID.iam.gserviceaccount.com
+        - group:developers@example.com
+    
+    # Staging secrets
+    - secret: staging-*
+      role: roles/secretmanager.secretAccessor
+      members:
+        - serviceAccount:nexusforge-staging@PROJECT_ID.iam.gserviceaccount.com
+        - group:platform-admins@example.com
+    
+    # Production secrets (restricted)
+    - secret: prod-*
+      role: roles/secretmanager.secretAccessor
+      members:
+        - serviceAccount:nexusforge-prod@PROJECT_ID.iam.gserviceaccount.com
+        - group:platform-admins@example.com
+    
+    # Secret version management
+    - secret: "*"
+      role: roles/secretmanager.secretVersionManager
+      members:
+        - serviceAccount:github-actions-sa@PROJECT_ID.iam.gserviceaccount.com
+        - group:platform-admins@example.com
+
+  # ==========================================
+  # Cloud SQL IAM policies
+  # ==========================================
+  cloud_sql:
+    # Development database access
+    - instance: nexusforge-db-dev
+      role: roles/cloudsql.client
+      members:
+        - serviceAccount:nexusforge-dev@PROJECT_ID.iam.gserviceaccount.com
+        - group:developers@example.com
+    
+    # Staging database access
+    - instance: nexusforge-db-staging
+      role: roles/cloudsql.client
+      members:
+        - serviceAccount:nexusforge-staging@PROJECT_ID.iam.gserviceaccount.com
+        - group:platform-admins@example.com
+    
+    # Production database access (highly restricted)
+    - instance: nexusforge-db-prod
+      role: roles/cloudsql.client
+      members:
+        - serviceAccount:nexusforge-prod@PROJECT_ID.iam.gserviceaccount.com
+    
+    # Database administration
+    - instance: "*"
+      role: roles/cloudsql.admin
+      members:
+        - serviceAccount:github-actions-sa@PROJECT_ID.iam.gserviceaccount.com
+        - group:platform-admins@example.com
+
+  # ==========================================
+  # Artifact Registry IAM policies
+  # ==========================================
+  artifact_registry:
+    # Read access for all services
+    - repository: nexusforge-docker
+      role: roles/artifactregistry.reader
+      members:
+        - serviceAccount:nexusforge-dev@PROJECT_ID.iam.gserviceaccount.com
+        - serviceAccount:nexusforge-staging@PROJECT_ID.iam.gserviceaccount.com
+        - serviceAccount:nexusforge-prod@PROJECT_ID.iam.gserviceaccount.com
+    
+    # Write access for CI/CD
+    - repository: nexusforge-docker
+      role: roles/artifactregistry.writer
+      members:
+        - serviceAccount:github-actions-sa@PROJECT_ID.iam.gserviceaccount.com
+
+  # ==========================================
+  # Storage Bucket IAM policies
+  # ==========================================
+  storage:
+    # Backup bucket (restricted)
+    - bucket: nexusforge-backups
+      role: roles/storage.objectAdmin
+      members:
+        - serviceAccount:github-actions-sa@PROJECT_ID.iam.gserviceaccount.com
+        - group:platform-admins@example.com
+    
+    - bucket: nexusforge-backups
+      role: roles/storage.objectViewer
+      members:
+        - group:developers@example.com
+
+# ============================================
+# Workload Identity Federation
+# ============================================
+workload_identity:
+  # GitHub Actions Workload Identity Pool
+  - pool_id: github-actions-pool
+    pool_display_name: "GitHub Actions Workload Identity Pool"
+    pool_description: "Workload Identity Pool for GitHub Actions"
+    
+    # Provider configuration
+    provider_id: github-actions-provider
+    provider_display_name: "GitHub Actions Provider"
+    issuer_uri: "https://token.actions.githubusercontent.com"
+    
+    # Attribute mapping
+    attribute_mapping:
+      google.subject: assertion.sub
+      attribute.actor: assertion.actor
+      attribute.repository: assertion.repository
+      attribute.repository_owner: assertion.repository_owner
+    
+    # Attribute conditions
+    attribute_condition: |
+      assertion.repository_owner == 'YOUR_GITHUB_ORG'
+    
+    # Service account bindings
+    service_account_bindings:
+      - service_account: github-actions-sa@PROJECT_ID.iam.gserviceaccount.com
+        members:
+          - principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-actions-pool/attribute.repository/YOUR_GITHUB_ORG/nexusforge-platform
+
+# ============================================
+# Application-Level RBAC
+# ============================================
+application_roles:
+  # ==========================================
+  # User roles
+  # ==========================================
+  roles:
+    # Super Admin
+    - name: super_admin
+      display_name: "Super Administrator"
+      description: "Full access to all resources and settings"
+      permissions:
+        - "*"
+      users:
+        - admin@example.com
+    
+    # Admin
+    - name: admin
+      display_name: "Administrator"
+      description: "Administrative access to most resources"
+      permissions:
+        - users:*
+        - roles:read
+        - services:*
+        - deployments:*
+        - monitoring:*
+        - logs:read
+      users:
+        - platform-admin@example.com
+      groups:
+        - platform-admins
+    
+    # Developer
+    - name: developer
+      display_name: "Developer"
+      description: "Development and deployment access"
+      permissions:
+        - services:read
+        - services:write
+        - deployments:create
+        - deployments:read
+        - logs:read
+        - monitoring:read
+      users:
+        - dev1@example.com
+        - dev2@example.com
+      groups:
+        - developers
+    
+    # Viewer
+    - name: viewer
+      display_name: "Viewer"
+      description: "Read-only access to resources"
+      permissions:
+        - services:read
+        - deployments:read
+        - logs:read
+        - monitoring:read
+      groups:
+        - support
+        - stakeholders
+    
+    # CI/CD Bot
+    - name: cicd_bot
+      display_name: "CI/CD Bot"
+      description: "Automated deployment access"
+      permissions:
+        - services:read
+        - services:deploy
+        - deployments:create
+        - deployments:read
+        - monitoring:write
+      service_accounts:
+        - github-actions@PROJECT_ID.iam.gserviceaccount.com
+
+  # ==========================================
+  # Resource-based access control
+  # ==========================================
+  resources:
+    # Environment-based access
+    environments:
+      dev:
+        access_control:
+          read: [admin, developer, viewer]
+          write: [admin, developer]
+          deploy: [admin, developer, cicd_bot]
+      
+      staging:
+        access_control:
+          read: [admin, developer, viewer]
+          write: [admin]
+          deploy: [admin, cicd_bot]
+      
+      prod:
+        access_control:
+          read: [admin, viewer]
+          write: [admin]
+          deploy: [admin, cicd_bot]
+    
+    # Service-based access
+    services:
+      python:
+        owners: [backend-team]
+        maintainers: [admin, developer]
+        viewers: [viewer]
+      
+      node:
+        owners: [backend-team]
+        maintainers: [admin, developer]
+        viewers: [viewer]
+      
+      go:
+        owners: [backend-team]
+        maintainers: [admin, developer]
+        viewers: [viewer]
+
+# ============================================
+# Security Policies
+# ============================================
+security_policies:
+  # ==========================================
+  # Authentication requirements
+  # ==========================================
+  authentication:
+    # Require MFA for production access
+    mfa_required:
+      - prod_access
+      - secret_access
+      - admin_operations
+    
+    # Session settings
+    session_timeout: 3600  # 1 hour
+    max_sessions_per_user: 3
+    
+    # Password policy
+    password_policy:
+      min_length: 12
+      require_uppercase: true
+      require_lowercase: true
+      require_numbers: true
+      require_symbols: true
+      expiry_days: 90
+
+  # ==========================================
+  # Network policies
+  # ==========================================
+  network:
+    # IP allowlisting
+    allowed_ip_ranges:
+      - 0.0.0.0/0  # Allow all (change for production)
+    
+    # VPC settings
+    vpc_access_required:
+      - prod_databases
+      - staging_databases
+    
+    # Private service access
+    private_service_connect:
+      - cloud_sql
+      - redis
+
+  # ==========================================
+  # Audit logging
+  # ==========================================
+  audit:
+    # Log all access to production
+    log_access:
+      - environment: prod
+        actions: ["*"]
+      
+      - environment: staging
+        actions: [write, delete, deploy]
+      
+      - resource_type: secrets
+        actions: ["*"]
+    
+    # Retention
+    retention_days: 365
+    
+    # Alerts
+    alert_on:
+      - failed_authentication
+      - privilege_escalation
+      - sensitive_data_access
+      - production_changes
+
+  # ==========================================
+  # Compliance
+  # ==========================================
+  compliance:
+    # Required approvals
+    approval_required:
+      prod_deployment: 2
+      role_assignment: 2
+      secret_rotation: 1
+    
+    # Change management
+    change_management:
+      require_ticket: true
+      require_documentation: true
+      require_rollback_plan: true
+
+# ============================================
+# Service Mesh / API Gateway Policies (Future)
+# ============================================
+service_mesh_policies:
+  # Placeholder for Istio/Envoy authorization policies
+  authorization_policies: []
+  
+  # Placeholder for mutual TLS configuration
+  peer_authentication: []

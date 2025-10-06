@@ -1,0 +1,336 @@
+# ============================================
+# NexusForge Platform - Prometheus Configuration
+# ============================================
+# Metrics collection and monitoring configuration
+# ============================================
+
+global:
+  # How frequently to scrape targets
+  scrape_interval: 30s
+  
+  # How long until a scrape request times out
+  scrape_timeout: 10s
+  
+  # How frequently to evaluate rules
+  evaluation_interval: 30s
+  
+  # External labels to add to all metrics
+  external_labels:
+    cluster: 'nexusforge-local'
+    environment: 'development'
+    platform: 'docker-compose'
+
+# Alertmanager configuration (optional)
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - 'alertmanager:9093'
+
+# Load rules once and periodically evaluate them
+rule_files:
+  # - "alerts/*.yml"
+  # - "recording_rules/*.yml"
+
+# ============================================
+# Scrape Configurations
+# ============================================
+scrape_configs:
+  # ==========================================
+  # Prometheus self-monitoring
+  # ==========================================
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+          component: 'monitoring'
+
+  # ==========================================
+  # Python FastAPI Service
+  # ==========================================
+  - job_name: 'python-service'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    
+    metrics_path: '/metrics'
+    scheme: http
+    
+    static_configs:
+      - targets: ['python-service:8000']
+        labels:
+          service: 'python'
+          language: 'python'
+          framework: 'fastapi'
+          component: 'api'
+          team: 'backend'
+    
+    # Relabeling
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'python-service'
+      
+      - source_labels: [__address__]
+        target_label: __address__
+        replacement: 'python-service:8000'
+    
+    # Metric relabeling
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'python_.*'
+        action: keep
+
+  # ==========================================
+  # Node.js Express Service
+  # ==========================================
+  - job_name: 'node-service'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    
+    metrics_path: '/metrics'
+    scheme: http
+    
+    static_configs:
+      - targets: ['node-service:3000']
+        labels:
+          service: 'node'
+          language: 'nodejs'
+          framework: 'express'
+          component: 'api'
+          team: 'backend'
+    
+    # Relabeling
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'node-service'
+      
+      - source_labels: [__address__]
+        target_label: __address__
+        replacement: 'node-service:3000'
+    
+    # Metric relabeling
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'nodejs_.*|http_.*|process_.*'
+        action: keep
+
+  # ==========================================
+  # Go HTTP Service
+  # ==========================================
+  - job_name: 'go-service'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    
+    metrics_path: '/metrics'
+    scheme: http
+    
+    static_configs:
+      - targets: ['go-service:8080']
+        labels:
+          service: 'go'
+          language: 'go'
+          framework: 'gin'
+          component: 'api'
+          team: 'backend'
+    
+    # Relabeling
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'go-service'
+      
+      - source_labels: [__address__]
+        target_label: __address__
+        replacement: 'go-service:8080'
+    
+    # Metric relabeling
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'go_.*|http_.*|process_.*'
+        action: keep
+
+  # ==========================================
+  # PostgreSQL Database (requires postgres_exporter)
+  # ==========================================
+  - job_name: 'postgres'
+    scrape_interval: 60s
+    scrape_timeout: 10s
+    
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+        labels:
+          service: 'postgres'
+          component: 'database'
+    
+    # Uncomment when postgres_exporter is added to docker-compose
+    # honor_labels: true
+
+  # ==========================================
+  # Redis Cache (requires redis_exporter)
+  # ==========================================
+  - job_name: 'redis'
+    scrape_interval: 60s
+    scrape_timeout: 10s
+    
+    static_configs:
+      - targets: ['redis-exporter:9121']
+        labels:
+          service: 'redis'
+          component: 'cache'
+    
+    # Uncomment when redis_exporter is added to docker-compose
+    # honor_labels: true
+
+  # ==========================================
+  # Nginx Reverse Proxy (requires nginx-prometheus-exporter)
+  # ==========================================
+  - job_name: 'nginx'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    
+    static_configs:
+      - targets: ['nginx-exporter:9113']
+        labels:
+          service: 'nginx'
+          component: 'proxy'
+    
+    # Uncomment when nginx-exporter is added to docker-compose
+    # honor_labels: true
+
+  # ==========================================
+  # Docker Container Metrics (requires cAdvisor)
+  # ==========================================
+  - job_name: 'cadvisor'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    
+    static_configs:
+      - targets: ['cadvisor:8080']
+        labels:
+          service: 'cadvisor'
+          component: 'monitoring'
+    
+    # Uncomment when cAdvisor is added to docker-compose
+    # honor_labels: true
+    
+    # Metric relabeling to reduce cardinality
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'container_.*'
+        action: keep
+      
+      - source_labels: [container_label_com_docker_compose_service]
+        target_label: service
+      
+      - source_labels: [container_label_com_docker_compose_project]
+        target_label: project
+
+  # ==========================================
+  # Node Exporter (system metrics - optional)
+  # ==========================================
+  - job_name: 'node-exporter'
+    scrape_interval: 60s
+    scrape_timeout: 10s
+    
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          service: 'node-exporter'
+          component: 'monitoring'
+    
+    # Uncomment when node-exporter is added to docker-compose
+    # honor_labels: true
+
+# ============================================
+# Example Alert Rules (create alerts/ directory)
+# ============================================
+# File: alerts/application.yml
+#
+# groups:
+#   - name: application_alerts
+#     interval: 30s
+#     rules:
+#       # High error rate
+#       - alert: HighErrorRate
+#         expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+#         for: 5m
+#         labels:
+#           severity: critical
+#         annotations:
+#           summary: "High error rate detected"
+#           description: "{{ $labels.service }} has error rate above 5%"
+#       
+#       # Service down
+#       - alert: ServiceDown
+#         expr: up{job=~".*-service"} == 0
+#         for: 1m
+#         labels:
+#           severity: critical
+#         annotations:
+#           summary: "Service is down"
+#           description: "{{ $labels.job }} is not responding"
+#       
+#       # High response time
+#       - alert: HighResponseTime
+#         expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1
+#         for: 5m
+#         labels:
+#           severity: warning
+#         annotations:
+#           summary: "High response time"
+#           description: "{{ $labels.service }} P95 latency is above 1s"
+#       
+#       # High memory usage
+#       - alert: HighMemoryUsage
+#         expr: (container_memory_usage_bytes / container_spec_memory_limit_bytes) > 0.9
+#         for: 5m
+#         labels:
+#           severity: warning
+#         annotations:
+#           summary: "High memory usage"
+#           description: "{{ $labels.container_label_com_docker_compose_service }} memory usage above 90%"
+#       
+#       # Database connection issues
+#       - alert: DatabaseConnectionIssues
+#         expr: rate(database_connection_errors_total[5m]) > 0
+#         for: 5m
+#         labels:
+#           severity: warning
+#         annotations:
+#           summary: "Database connection issues"
+#           description: "{{ $labels.service }} experiencing database connection errors"
+
+# ============================================
+# Example Recording Rules (create recording_rules/ directory)
+# ============================================
+# File: recording_rules/application.yml
+#
+# groups:
+#   - name: application_recording_rules
+#     interval: 30s
+#     rules:
+#       # Request rate per service
+#       - record: service:http_requests:rate5m
+#         expr: rate(http_requests_total[5m])
+#       
+#       # Error rate per service
+#       - record: service:http_errors:rate5m
+#         expr: rate(http_requests_total{status=~"5.."}[5m])
+#       
+#       # Request duration P95
+#       - record: service:http_request_duration:p95
+#         expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+#       
+#       # Request duration P99
+#       - record: service:http_request_duration:p99
+#         expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+#       
+#       # CPU usage percentage
+#       - record: service:cpu_usage:percentage
+#         expr: (rate(container_cpu_usage_seconds_total[5m]) * 100)
+#       
+#       # Memory usage percentage
+#       - record: service:memory_usage:percentage
+#         expr: (container_memory_usage_bytes / container_spec_memory_limit_bytes) * 100

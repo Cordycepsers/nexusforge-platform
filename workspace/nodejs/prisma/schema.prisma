@@ -1,0 +1,38 @@
+// Prisma schema for PostgreSQL database
+// Run: npx prisma generate after changes
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User model
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique @db.VarChar(255)
+  username  String   @unique @db.VarChar(100)
+  hashedPassword String @db.VarChar(255)
+  fullName  String?  @db.VarChar(255)
+
+  // Status flags
+  isActive    Boolean @default(true)
+  isVerified  Boolean @default(false)
+  isSuperuser Boolean @default(false)
+
+  // Timestamps
+  lastLoginAt    DateTime?
+  emailVerifiedAt DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  // Indexes
+  @@index([email, isActive])
+  @@index([username, isActive])
+  @@index([createdAt])
+  @@map("users")
+}

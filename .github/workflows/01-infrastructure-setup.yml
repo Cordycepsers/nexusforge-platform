@@ -1,0 +1,474 @@
+name: 01 - Infrastructure Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to setup (dev, staging, prod, all)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+          - all
+        default: 'dev'
+      vm_type:
+        description: 'VM setup type'
+        required: true
+        type: choice
+        options:
+          - standard
+          - all-in-one
+        default: 'all-in-one'
+      machine_type:
+        description: 'GCP machine type'
+        required: false
+        type: string
+        default: 'e2-standard-4'
+      enable_monitoring:
+        description: 'Enable monitoring setup'
+        required: false
+        type: boolean
+        default: true
+      enable_backup:
+        description: 'Enable backup configuration'
+        required: false
+        type: boolean
+        default: true
+      dry_run:
+        description: 'Perform dry run (preview changes only)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  ZONE: us-central1-a
+  TEAM_NAME: nexusforge
+
+jobs:
+  # ============================================
+  # Validate prerequisites
+  # ============================================
+  validate:
+    name: Validate Prerequisites
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Validate GCP Project
+        run: |
+          echo "::group::Validate GCP project configuration"
+          
+          # Check project exists and is accessible
+          if ! gcloud projects describe "${{ env.PROJECT_ID }}" &>/dev/null; then
+            echo "::error::Project ${{ env.PROJECT_ID }} not found or not accessible"
+            exit 1
+          fi
+          
+          echo "✓ Project accessible"
+          
+          # Check billing is enabled
+          BILLING_ENABLED=$(gcloud beta billing projects describe "${{ env.PROJECT_ID }}" \
+            --format='value(billingEnabled)' 2>/dev/null || echo "false")
+          
+          if [ "$BILLING_ENABLED" != "True" ]; then
+            echo "::warning::Billing is not enabled for this project"
+          else
+            echo "✓ Billing enabled"
+          fi
+          
+          # Check required APIs
+          REQUIRED_APIS=(
+            "compute.googleapis.com"
+            "run.googleapis.com"
+            "sqladmin.googleapis.com"
+            "artifactregistry.googleapis.com"
+            "cloudresourcemanager.googleapis.com"
+            "iam.googleapis.com"
+            "iamcredentials.googleapis.com"
+            "secretmanager.googleapis.com"
+          )
+          
+          echo "Checking required APIs..."
+          for api in "${REQUIRED_APIS[@]}"; do
+            if gcloud services list --enabled --filter="name:${api}" --format="value(name)" | grep -q "${api}"; then
+              echo "✓ ${api} is enabled"
+            else
+              echo "::warning::${api} is not enabled - will be enabled during setup"
+            fi
+          done
+          
+          echo "::endgroup::"
+
+      - name: Check Existing Resources
+        run: |
+          echo "::group::Check for existing resources"
+          
+          # Check for existing VMs
+          EXISTING_VMS=$(gcloud compute instances list \
+            --filter="labels.team=${{ env.TEAM_NAME }}" \
+            --format="value(name)" | wc -l)
+          
+          echo "Existing VMs with team label: ${EXISTING_VMS}"
+          
+          # Check for existing Cloud Run services
+          EXISTING_SERVICES=$(gcloud run services list \
+            --region "${{ env.REGION }}" \
+            --format="value(name)" | grep -c "${{ env.TEAM_NAME }}" || echo "0")
+          
+          echo "Existing Cloud Run services: ${EXISTING_SERVICES}"
+          
+          if [ "$EXISTING_VMS" -gt 0 ] || [ "$EXISTING_SERVICES" -gt 0 ]; then
+            echo "::warning::Found existing resources - setup may update or recreate them"
+          fi
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Enable required APIs
+  # ============================================
+  enable-apis:
+    name: Enable Required APIs
+    runs-on: ubuntu-latest
+    needs: validate
+    if: inputs.dry_run == false
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Enable APIs
+        run: |
+          echo "::group::Enable required GCP APIs"
+          
+          gcloud services enable \
+            compute.googleapis.com \
+            run.googleapis.com \
+            sqladmin.googleapis.com \
+            artifactregistry.googleapis.com \
+            cloudresourcemanager.googleapis.com \
+            iam.googleapis.com \
+            iamcredentials.googleapis.com \
+            secretmanager.googleapis.com \
+            logging.googleapis.com \
+            monitoring.googleapis.com \
+            cloudtrace.googleapis.com \
+            cloudbuild.googleapis.com \
+            containerscanning.googleapis.com \
+            --project "${{ env.PROJECT_ID }}"
+          
+          echo "✓ All required APIs enabled"
+          echo "::endgroup::"
+
+  # ============================================
+  # Setup networking
+  # ============================================
+  setup-network:
+    name: Setup Network Infrastructure
+    runs-on: ubuntu-latest
+    needs: enable-apis
+    if: inputs.dry_run == false
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Create VPC Network
+        run: |
+          echo "::group::Create VPC network"
+          
+          NETWORK_NAME="${{ env.TEAM_NAME }}-vpc"
+          
+          # Check if network exists
+          if ! gcloud compute networks describe "$NETWORK_NAME" \
+            --project "${{ env.PROJECT_ID }}" &>/dev/null; then
+            
+            echo "Creating VPC network: ${NETWORK_NAME}"
+            gcloud compute networks create "$NETWORK_NAME" \
+              --subnet-mode=auto \
+              --bgp-routing-mode=regional \
+              --project "${{ env.PROJECT_ID }}"
+            
+            echo "✓ VPC network created"
+          else
+            echo "VPC network already exists"
+          fi
+          
+          echo "::endgroup::"
+
+      - name: Create Firewall Rules
+        run: |
+          echo "::group::Create firewall rules"
+          
+          NETWORK_NAME="${{ env.TEAM_NAME }}-vpc"
+          
+          # Allow SSH
+          if ! gcloud compute firewall-rules describe "${NETWORK_NAME}-allow-ssh" \
+            --project "${{ env.PROJECT_ID }}" &>/dev/null; then
+            
+            gcloud compute firewall-rules create "${NETWORK_NAME}-allow-ssh" \
+              --network "$NETWORK_NAME" \
+              --allow tcp:22 \
+              --source-ranges 0.0.0.0/0 \
+              --description "Allow SSH access" \
+              --project "${{ env.PROJECT_ID }}"
+            
+            echo "✓ SSH firewall rule created"
+          fi
+          
+          # Allow HTTP/HTTPS
+          if ! gcloud compute firewall-rules describe "${NETWORK_NAME}-allow-http" \
+            --project "${{ env.PROJECT_ID }}" &>/dev/null; then
+            
+            gcloud compute firewall-rules create "${NETWORK_NAME}-allow-http" \
+              --network "$NETWORK_NAME" \
+              --allow tcp:80,tcp:443 \
+              --source-ranges 0.0.0.0/0 \
+              --description "Allow HTTP/HTTPS access" \
+              --project "${{ env.PROJECT_ID }}"
+            
+            echo "✓ HTTP/HTTPS firewall rule created"
+          fi
+          
+          # Allow internal communication
+          if ! gcloud compute firewall-rules describe "${NETWORK_NAME}-allow-internal" \
+            --project "${{ env.PROJECT_ID }}" &>/dev/null; then
+            
+            gcloud compute firewall-rules create "${NETWORK_NAME}-allow-internal" \
+              --network "$NETWORK_NAME" \
+              --allow tcp:0-65535,udp:0-65535,icmp \
+              --source-ranges 10.0.0.0/8 \
+              --description "Allow internal communication" \
+              --project "${{ env.PROJECT_ID }}"
+            
+            echo "✓ Internal firewall rule created"
+          fi
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Setup Artifact Registry
+  # ============================================
+  setup-artifact-registry:
+    name: Setup Artifact Registry
+    runs-on: ubuntu-latest
+    needs: enable-apis
+    if: inputs.dry_run == false
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Create Docker Repository
+        run: |
+          echo "::group::Create Artifact Registry repository"
+          
+          REPO_NAME="${{ env.TEAM_NAME }}-docker"
+          
+          if ! gcloud artifacts repositories describe "$REPO_NAME" \
+            --location "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" &>/dev/null; then
+            
+            echo "Creating Docker repository: ${REPO_NAME}"
+            gcloud artifacts repositories create "$REPO_NAME" \
+              --repository-format=docker \
+              --location "${{ env.REGION }}" \
+              --description "Docker images for NexusForge platform" \
+              --project "${{ env.PROJECT_ID }}"
+            
+            echo "✓ Artifact Registry repository created"
+          else
+            echo "Repository already exists"
+          fi
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Setup development VM
+  # ============================================
+  setup-dev-vm:
+    name: Setup Development VM
+    runs-on: ubuntu-latest
+    needs: [setup-network, setup-artifact-registry]
+    if: inputs.dry_run == false && (inputs.environment == 'dev' || inputs.environment == 'all')
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Run VM Setup Script
+        run: |
+          echo "::group::Setup development VM"
+          
+          chmod +x infrastructure/scripts/*.sh
+          
+          if [ "${{ inputs.vm_type }}" == "all-in-one" ]; then
+            export MACHINE_TYPE="${{ inputs.machine_type }}"
+            ./infrastructure/scripts/03-dev-vm-all-in-one-setup.sh
+          else
+            export ENVIRONMENT="dev"
+            ./infrastructure/scripts/02-dev-vm-setup.sh
+          fi
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Setup monitoring
+  # ============================================
+  setup-monitoring:
+    name: Setup Monitoring
+    runs-on: ubuntu-latest
+    needs: enable-apis
+    if: inputs.dry_run == false && inputs.enable_monitoring == true
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Configure Monitoring
+        run: |
+          echo "::group::Configure monitoring and alerting"
+          
+          chmod +x infrastructure/scripts/04-monitoring-setup.sh
+          ./infrastructure/scripts/04-monitoring-setup.sh
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Setup backups
+  # ============================================
+  setup-backup:
+    name: Setup Backup Configuration
+    runs-on: ubuntu-latest
+    needs: enable-apis
+    if: inputs.dry_run == false && inputs.enable_backup == true
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Configure Backups
+        run: |
+          echo "::group::Configure backup policies"
+          
+          chmod +x infrastructure/scripts/05-backup-setup.sh
+          ./infrastructure/scripts/05-backup-setup.sh
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Summary
+  # ============================================
+  summary:
+    name: Infrastructure Setup Summary
+    runs-on: ubuntu-latest
+    needs: [validate, enable-apis, setup-network, setup-artifact-registry, setup-dev-vm, setup-monitoring, setup-backup]
+    if: always()
+    
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## 🏗️ Infrastructure Setup Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | \`${{ inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| VM Type | \`${{ inputs.vm_type }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Machine Type | \`${{ inputs.machine_type }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Project | \`${{ env.PROJECT_ID }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | \`${{ env.REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Monitoring | ${{ inputs.enable_monitoring }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backup | ${{ inputs.enable_backup }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | ${{ inputs.dry_run }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Status" >> $GITHUB_STEP_SUMMARY
+          echo "- Validation: ${{ needs.validate.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- APIs: ${{ needs.enable-apis.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Network: ${{ needs.setup-network.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Artifact Registry: ${{ needs.setup-artifact-registry.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Dev VM: ${{ needs.setup-dev-vm.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Monitoring: ${{ needs.setup-monitoring.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Backup: ${{ needs.setup-backup.result }}" >> $GITHUB_STEP_SUMMARY

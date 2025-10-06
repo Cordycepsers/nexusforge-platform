@@ -1,0 +1,325 @@
+name: 'Build and Push Docker Image'
+description: 'Build Docker image and push to Google Artifact Registry with multi-platform support'
+author: 'NexusForge Team'
+
+inputs:
+  service:
+    description: 'Service name (python, node, go)'
+    required: true
+  dockerfile:
+    description: 'Path to Dockerfile'
+    required: true
+  context:
+    description: 'Build context path'
+    required: false
+    default: '.'
+  project_id:
+    description: 'GCP Project ID'
+    required: true
+  region:
+    description: 'GCP Region for Artifact Registry'
+    required: true
+  repository:
+    description: 'Artifact Registry repository name'
+    required: false
+    default: 'nexusforge-docker'
+  image_tag:
+    description: 'Primary image tag'
+    required: true
+  additional_tags:
+    description: 'Additional tags (comma-separated)'
+    required: false
+    default: ''
+  build_args:
+    description: 'Build arguments (KEY=VALUE format, one per line)'
+    required: false
+    default: ''
+  platforms:
+    description: 'Target platforms (comma-separated)'
+    required: false
+    default: 'linux/amd64'
+  cache_enabled:
+    description: 'Enable build caching'
+    required: false
+    default: 'true'
+  scan_image:
+    description: 'Run security scan on built image'
+    required: false
+    default: 'true'
+  push_image:
+    description: 'Push image to registry'
+    required: false
+    default: 'true'
+
+outputs:
+  image_url:
+    description: 'Full image URL'
+    value: ${{ steps.metadata.outputs.image_url }}
+  digest:
+    description: 'Image digest'
+    value: ${{ steps.build.outputs.digest }}
+  tags:
+    description: 'All image tags'
+    value: ${{ steps.metadata.outputs.tags }}
+  image_size:
+    description: 'Image size in bytes'
+    value: ${{ steps.info.outputs.size }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ============================================
+    # Set up build environment
+    # ============================================
+    - name: Set up build metadata
+      id: metadata
+      shell: bash
+      run: |
+        echo "::group::Generate build metadata"
+        
+        # Construct base image URL
+        IMAGE_BASE="${{ inputs.region }}-docker.pkg.dev/${{ inputs.project_id }}/${{ inputs.repository }}/${{ inputs.service }}"
+        IMAGE_URL="${IMAGE_BASE}:${{ inputs.image_tag }}"
+        
+        echo "image_url=${IMAGE_URL}" >> $GITHUB_OUTPUT
+        echo "image_base=${IMAGE_BASE}" >> $GITHUB_OUTPUT
+        
+        # Generate all tags
+        TAGS="${IMAGE_URL}"
+        
+        # Add additional tags
+        if [ -n "${{ inputs.additional_tags }}" ]; then
+          IFS=',' read -ra EXTRA_TAGS <<< "${{ inputs.additional_tags }}"
+          for tag in "${EXTRA_TAGS[@]}"; do
+            TAGS="${TAGS},${IMAGE_BASE}:${tag}"
+          done
+        fi
+        
+        echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+        
+        # Set build timestamp
+        BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+        echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+        
+        echo "Image URL: ${IMAGE_URL}"
+        echo "All tags: ${TAGS}"
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Set up Docker Buildx
+    # ============================================
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        install: true
+        driver-opts: |
+          image=moby/buildkit:latest
+          network=host
+
+    # ============================================
+    # Set up QEMU for multi-platform builds
+    # ============================================
+    - name: Set up QEMU
+      if: contains(inputs.platforms, ',') || contains(inputs.platforms, 'arm')
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: ${{ inputs.platforms }}
+
+    # ============================================
+    # Prepare build arguments
+    # ============================================
+    - name: Prepare Build Arguments
+      id: build-args
+      shell: bash
+      run: |
+        echo "::group::Prepare build arguments"
+        
+        # Create build args file
+        BUILD_ARGS_FILE=$(mktemp)
+        
+        # Add standard build args
+        cat > "$BUILD_ARGS_FILE" << EOF
+        BUILD_DATE=${{ steps.metadata.outputs.build_date }}
+        VERSION=${{ inputs.image_tag }}
+        VCS_REF=${{ github.sha }}
+        VCS_URL=${{ github.server_url }}/${{ github.repository }}
+        EOF
+        
+        # Add custom build args
+        if [ -n "${{ inputs.build_args }}" ]; then
+          echo "${{ inputs.build_args }}" >> "$BUILD_ARGS_FILE"
+        fi
+        
+        # Convert to Docker build-arg format
+        BUILD_ARGS=""
+        while IFS= read -r line; do
+          if [ -n "$line" ]; then
+            BUILD_ARGS="${BUILD_ARGS} --build-arg ${line}"
+          fi
+        done < "$BUILD_ARGS_FILE"
+        
+        echo "build_args=${BUILD_ARGS}" >> $GITHUB_OUTPUT
+        
+        echo "Build arguments prepared"
+        cat "$BUILD_ARGS_FILE"
+        
+        rm -f "$BUILD_ARGS_FILE"
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Configure cache
+    # ============================================
+    - name: Configure Build Cache
+      id: cache
+      shell: bash
+      run: |
+        if [ "${{ inputs.cache_enabled }}" == "true" ]; then
+          CACHE_FROM="type=gha,scope=${{ inputs.service }}"
+          CACHE_TO="type=gha,scope=${{ inputs.service }},mode=max"
+        else
+          CACHE_FROM=""
+          CACHE_TO=""
+        fi
+        
+        echo "cache_from=${CACHE_FROM}" >> $GITHUB_OUTPUT
+        echo "cache_to=${CACHE_TO}" >> $GITHUB_OUTPUT
+
+    # ============================================
+    # Build Docker image
+    # ============================================
+    - name: Build Docker Image
+      id: build
+      shell: bash
+      run: |
+        echo "::group::Build Docker image"
+        
+        # Prepare tags argument
+        TAGS_ARG=""
+        IFS=',' read -ra TAG_LIST <<< "${{ steps.metadata.outputs.tags }}"
+        for tag in "${TAG_LIST[@]}"; do
+          TAGS_ARG="${TAGS_ARG} --tag ${tag}"
+        done
+        
+        # Prepare cache arguments
+        CACHE_ARGS=""
+        if [ -n "${{ steps.cache.outputs.cache_from }}" ]; then
+          CACHE_ARGS="${CACHE_ARGS} --cache-from ${{ steps.cache.outputs.cache_from }}"
+        fi
+        if [ -n "${{ steps.cache.outputs.cache_to }}" ]; then
+          CACHE_ARGS="${CACHE_ARGS} --cache-to ${{ steps.cache.outputs.cache_to }}"
+        fi
+        
+        # Build command
+        BUILD_CMD="docker buildx build \
+          --file ${{ inputs.dockerfile }} \
+          --platform ${{ inputs.platforms }} \
+          ${TAGS_ARG} \
+          ${{ steps.build-args.outputs.build_args }} \
+          ${CACHE_ARGS} \
+          --label org.opencontainers.image.created=${{ steps.metadata.outputs.build_date }} \
+          --label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
+          --label org.opencontainers.image.version=${{ inputs.image_tag }} \
+          --label org.opencontainers.image.revision=${{ github.sha }} \
+          --label org.opencontainers.image.title=${{ inputs.service }} \
+          --label org.opencontainers.image.description='NexusForge ${{ inputs.service }} service' \
+          --label com.nexusforge.service=${{ inputs.service }} \
+          --label com.nexusforge.environment=${{ github.ref_name }}"
+        
+        # Add load flag for local testing or push flag for registry
+        if [ "${{ inputs.push_image }}" == "true" ]; then
+          BUILD_CMD="${BUILD_CMD} --push"
+        else
+          BUILD_CMD="${BUILD_CMD} --load"
+        fi
+        
+        # Add context
+        BUILD_CMD="${BUILD_CMD} ${{ inputs.context }}"
+        
+        # Execute build
+        echo "Executing: ${BUILD_CMD}"
+        eval ${BUILD_CMD}
+        
+        # Get image digest (only available after push)
+        if [ "${{ inputs.push_image }}" == "true" ]; then
+          DIGEST=$(docker buildx imagetools inspect "${{ steps.metadata.outputs.image_url }}" --format '{{.Manifest.Digest}}' || echo "")
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+        fi
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Get image information
+    # ============================================
+    - name: Get Image Information
+      id: info
+      shell: bash
+      run: |
+        echo "::group::Get image information"
+        
+        if [ "${{ inputs.push_image }}" == "true" ]; then
+          # Get size from registry
+          SIZE=$(docker buildx imagetools inspect "${{ steps.metadata.outputs.image_url }}" --format '{{.Manifest.Size}}' || echo "0")
+        else
+          # Get size from local image
+          SIZE=$(docker image inspect "${{ steps.metadata.outputs.image_url }}" --format='{{.Size}}' || echo "0")
+        fi
+        
+        echo "size=${SIZE}" >> $GITHUB_OUTPUT
+        
+        # Convert to human-readable format
+        SIZE_MB=$((SIZE / 1024 / 1024))
+        echo "size_mb=${SIZE_MB}" >> $GITHUB_OUTPUT
+        
+        echo "Image size: ${SIZE_MB} MB"
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Scan image for vulnerabilities
+    # ============================================
+    - name: Scan Image for Vulnerabilities
+      if: inputs.scan_image == 'true' && inputs.push_image == 'true'
+      uses: ./.github/actions/security-scan
+      with:
+        scan_type: 'container'
+        image_ref: ${{ steps.metadata.outputs.image_url }}
+        severity: 'CRITICAL,HIGH'
+        fail_on_severity: 'CRITICAL'
+      continue-on-error: true
+
+    # ============================================
+    # Generate build summary
+    # ============================================
+    - name: Generate Build Summary
+      shell: bash
+      run: |
+        echo "### Docker Image Build Complete 🐳" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Service | \`${{ inputs.service }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Image URL | \`${{ steps.metadata.outputs.image_url }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Digest | \`${{ steps.build.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Size | ${{ steps.info.outputs.size_mb }} MB |" >> $GITHUB_STEP_SUMMARY
+        echo "| Platforms | \`${{ inputs.platforms }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Build Date | \`${{ steps.metadata.outputs.build_date }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Git SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # List all tags
+        echo "#### Tags" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        IFS=',' read -ra TAG_LIST <<< "${{ steps.metadata.outputs.tags }}"
+        for tag in "${TAG_LIST[@]}"; do
+          echo "- \`${tag}\`" >> $GITHUB_STEP_SUMMARY
+        done
+
+    # ============================================
+    # Display success message
+    # ============================================
+    - name: Build Success
+      shell: bash
+      run: |
+        echo "::notice::Successfully built and pushed ${{ inputs.service }} image to ${{ steps.metadata.outputs.image_url }}"

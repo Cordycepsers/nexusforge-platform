@@ -1,0 +1,340 @@
+name: 'Security Scanning'
+description: 'Run comprehensive security scans on code, dependencies, and container images'
+author: 'NexusForge Team'
+
+inputs:
+  scan_type:
+    description: 'Type of scan to run: code, container, dependencies, or all'
+    required: false
+    default: 'all'
+  severity:
+    description: 'Minimum severity level to report (CRITICAL, HIGH, MEDIUM, LOW)'
+    required: false
+    default: 'CRITICAL,HIGH,MEDIUM'
+  image_ref:
+    description: 'Container image reference for container scanning'
+    required: false
+    default: ''
+  dockerfile_path:
+    description: 'Path to Dockerfile for container scanning'
+    required: false
+    default: './Dockerfile'
+  fail_on_severity:
+    description: 'Exit with error if vulnerabilities found at this level or higher'
+    required: false
+    default: 'CRITICAL'
+  upload_sarif:
+    description: 'Upload SARIF results to GitHub Security'
+    required: false
+    default: 'true'
+  working_directory:
+    description: 'Working directory for scans'
+    required: false
+    default: '.'
+
+outputs:
+  scan_results:
+    description: 'Path to scan results directory'
+    value: ${{ steps.scan.outputs.results_path }}
+  vulnerabilities_found:
+    description: 'Number of vulnerabilities found'
+    value: ${{ steps.summary.outputs.vuln_count }}
+  scan_status:
+    description: 'Overall scan status (passed, failed, warning)'
+    value: ${{ steps.summary.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ============================================
+    # Setup environment
+    # ============================================
+    - name: Create results directory
+      shell: bash
+      run: |
+        mkdir -p security-results
+        echo "RESULTS_DIR=$(pwd)/security-results" >> $GITHUB_ENV
+
+    # ============================================
+    # Install Trivy Scanner
+    # ============================================
+    - name: Install Trivy
+      shell: bash
+      run: |
+        echo "::group::Install Trivy Security Scanner"
+        
+        # Install Trivy
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install trivy -y
+        
+        # Verify installation
+        trivy --version
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Update Trivy database
+    # ============================================
+    - name: Update Trivy Database
+      shell: bash
+      run: |
+        echo "::group::Update Trivy vulnerability database"
+        trivy image --download-db-only
+        echo "::endgroup::"
+
+    # ============================================
+    # Filesystem Scan (Code & Dependencies)
+    # ============================================
+    - name: Run Filesystem Scan
+      if: inputs.scan_type == 'all' || inputs.scan_type == 'code' || inputs.scan_type == 'dependencies'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        echo "::group::Filesystem Security Scan"
+        
+        trivy filesystem \
+          --severity "${{ inputs.severity }}" \
+          --format json \
+          --output "$RESULTS_DIR/filesystem-scan.json" \
+          . || true
+        
+        trivy filesystem \
+          --severity "${{ inputs.severity }}" \
+          --format table \
+          . || true
+        
+        # Generate SARIF format for GitHub Security
+        if [ "${{ inputs.upload_sarif }}" == "true" ]; then
+          trivy filesystem \
+            --severity "${{ inputs.severity }}" \
+            --format sarif \
+            --output "$RESULTS_DIR/filesystem-scan.sarif" \
+            . || true
+        fi
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Container Image Scan
+    # ============================================
+    - name: Run Container Image Scan
+      if: (inputs.scan_type == 'all' || inputs.scan_type == 'container') && inputs.image_ref != ''
+      shell: bash
+      run: |
+        echo "::group::Container Image Security Scan"
+        
+        trivy image \
+          --severity "${{ inputs.severity }}" \
+          --format json \
+          --output "$RESULTS_DIR/image-scan.json" \
+          "${{ inputs.image_ref }}" || true
+        
+        trivy image \
+          --severity "${{ inputs.severity }}" \
+          --format table \
+          "${{ inputs.image_ref }}" || true
+        
+        # Generate SARIF format for GitHub Security
+        if [ "${{ inputs.upload_sarif }}" == "true" ]; then
+          trivy image \
+            --severity "${{ inputs.severity }}" \
+            --format sarif \
+            --output "$RESULTS_DIR/image-scan.sarif" \
+            "${{ inputs.image_ref }}" || true
+        fi
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Dockerfile Scan
+    # ============================================
+    - name: Run Dockerfile Scan
+      if: (inputs.scan_type == 'all' || inputs.scan_type == 'container')
+      shell: bash
+      run: |
+        echo "::group::Dockerfile Security Scan"
+        
+        if [ -f "${{ inputs.dockerfile_path }}" ]; then
+          trivy config \
+            --severity "${{ inputs.severity }}" \
+            --format json \
+            --output "$RESULTS_DIR/dockerfile-scan.json" \
+            "${{ inputs.dockerfile_path }}" || true
+          
+          trivy config \
+            --severity "${{ inputs.severity }}" \
+            --format table \
+            "${{ inputs.dockerfile_path }}" || true
+        else
+          echo "Dockerfile not found at ${{ inputs.dockerfile_path }}, skipping..."
+        fi
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Secret Scanning with Gitleaks
+    # ============================================
+    - name: Install Gitleaks
+      if: inputs.scan_type == 'all' || inputs.scan_type == 'code'
+      shell: bash
+      run: |
+        echo "::group::Install Gitleaks"
+        
+        wget -qO gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_linux_x64.tar.gz
+        tar -xzf gitleaks.tar.gz
+        sudo mv gitleaks /usr/local/bin/
+        rm gitleaks.tar.gz
+        
+        gitleaks version
+        
+        echo "::endgroup::"
+
+    - name: Run Secret Scan
+      if: inputs.scan_type == 'all' || inputs.scan_type == 'code'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        echo "::group::Secret Scanning"
+        
+        gitleaks detect \
+          --source . \
+          --report-format json \
+          --report-path "$RESULTS_DIR/secrets-scan.json" \
+          --verbose || true
+        
+        gitleaks detect \
+          --source . \
+          --report-format sarif \
+          --report-path "$RESULTS_DIR/secrets-scan.sarif" \
+          --verbose || true
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Analyze results and create summary
+    # ============================================
+    - name: Analyze Scan Results
+      id: summary
+      shell: bash
+      run: |
+        echo "::group::Analyze Security Scan Results"
+        
+        total_vulns=0
+        critical_count=0
+        high_count=0
+        medium_count=0
+        low_count=0
+        
+        # Parse Trivy results
+        for file in "$RESULTS_DIR"/*.json; do
+          if [ -f "$file" ] && [[ "$file" != *"secrets-scan"* ]]; then
+            # Count vulnerabilities by severity
+            if command -v jq &> /dev/null; then
+              crit=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$file" 2>/dev/null || echo 0)
+              high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$file" 2>/dev/null || echo 0)
+              med=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$file" 2>/dev/null || echo 0)
+              low=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$file" 2>/dev/null || echo 0)
+              
+              critical_count=$((critical_count + crit))
+              high_count=$((high_count + high))
+              medium_count=$((medium_count + med))
+              low_count=$((low_count + low))
+            fi
+          fi
+        done
+        
+        # Count secrets
+        secret_count=0
+        if [ -f "$RESULTS_DIR/secrets-scan.json" ]; then
+          if command -v jq &> /dev/null; then
+            secret_count=$(jq 'length' "$RESULTS_DIR/secrets-scan.json" 2>/dev/null || echo 0)
+          fi
+        fi
+        
+        total_vulns=$((critical_count + high_count + medium_count + low_count + secret_count))
+        
+        # Set outputs
+        echo "vuln_count=$total_vulns" >> $GITHUB_OUTPUT
+        echo "critical=$critical_count" >> $GITHUB_OUTPUT
+        echo "high=$high_count" >> $GITHUB_OUTPUT
+        echo "medium=$medium_count" >> $GITHUB_OUTPUT
+        echo "low=$low_count" >> $GITHUB_OUTPUT
+        echo "secrets=$secret_count" >> $GITHUB_OUTPUT
+        
+        # Determine status
+        status="passed"
+        if [ "${{ inputs.fail_on_severity }}" == "CRITICAL" ] && [ $critical_count -gt 0 ]; then
+          status="failed"
+        elif [ "${{ inputs.fail_on_severity }}" == "HIGH" ] && [ $((critical_count + high_count)) -gt 0 ]; then
+          status="failed"
+        elif [ "${{ inputs.fail_on_severity }}" == "MEDIUM" ] && [ $((critical_count + high_count + medium_count)) -gt 0 ]; then
+          status="failed"
+        elif [ $total_vulns -gt 0 ]; then
+          status="warning"
+        fi
+        
+        echo "status=$status" >> $GITHUB_OUTPUT
+        
+        echo "::endgroup::"
+        
+        # Display summary
+        echo "### Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| 🔴 Critical | $critical_count |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🟠 High | $high_count |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🟡 Medium | $medium_count |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🟢 Low | $low_count |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🔑 Secrets | $secret_count |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Total** | **$total_vulns** |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** $status" >> $GITHUB_STEP_SUMMARY
+
+    # ============================================
+    # Upload SARIF to GitHub Security
+    # ============================================
+    - name: Upload SARIF Results
+      if: inputs.upload_sarif == 'true' && always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: security-results
+        category: security-scan
+      continue-on-error: true
+
+    # ============================================
+    # Upload scan results as artifacts
+    # ============================================
+    - name: Upload Scan Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: security-scan-results
+        path: security-results/
+        retention-days: 30
+
+    # ============================================
+    # Set scan outputs
+    # ============================================
+    - name: Set Scan Outputs
+      id: scan
+      shell: bash
+      run: |
+        echo "results_path=$RESULTS_DIR" >> $GITHUB_OUTPUT
+
+    # ============================================
+    # Fail if critical vulnerabilities found
+    # ============================================
+    - name: Check Scan Status
+      shell: bash
+      run: |
+        if [ "${{ steps.summary.outputs.status }}" == "failed" ]; then
+          echo "::error::Security scan failed due to ${{ inputs.fail_on_severity }} severity vulnerabilities"
+          exit 1
+        elif [ "${{ steps.summary.outputs.status }}" == "warning" ]; then
+          echo "::warning::Security scan found vulnerabilities below failure threshold"
+        else
+          echo "::notice::Security scan passed - no significant vulnerabilities found"
+        fi

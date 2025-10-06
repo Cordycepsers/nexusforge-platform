@@ -1,0 +1,497 @@
+name: 04 - Deploy to Production
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to deploy (comma-separated: python,node,go or "all")'
+        required: false
+        type: string
+        default: 'all'
+      image_tag:
+        description: 'Image tag to deploy (default: latest-staging)'
+        required: false
+        type: string
+        default: 'latest-staging'
+      canary_percentage:
+        description: 'Canary deployment percentage (0-100)'
+        required: false
+        type: number
+        default: 25
+      canary_duration:
+        description: 'Canary monitoring duration in minutes'
+        required: false
+        type: number
+        default: 10
+
+env:
+  ENVIRONMENT: prod
+  REGION: us-central1
+  TEAM_NAME: nexusforge
+
+jobs:
+  # ============================================
+  # Production approval gate
+  # ============================================
+  approval:
+    name: Production Approval Required
+    runs-on: ubuntu-latest
+    environment:
+      name: production-approval
+    steps:
+      - name: Approval Gate
+        run: |
+          echo "## 🔐 Production Deployment Approval" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**CRITICAL:** Deploying to production environment" >> $GITHUB_STEP_SUMMARY
+          echo "Approved by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "Timestamp: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # Pre-deployment validation
+  # ============================================
+  validate:
+    name: Pre-Deployment Validation
+    runs-on: ubuntu-latest
+    needs: approval
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Validate Staging Deployment
+        run: |
+          echo "::group::Validate staging is healthy"
+          
+          # Get ID token for authenticated requests
+          ID_TOKEN=$(gcloud auth print-identity-token)
+          
+          # Validate all staging services are healthy
+          SERVICES=("python" "node" "go")
+          ALL_HEALTHY=true
+          
+          for service in "${SERVICES[@]}"; do
+            SERVICE_NAME="${{ env.TEAM_NAME }}-${service}-staging"
+            
+            if gcloud run services describe "$SERVICE_NAME" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}" &>/dev/null; then
+              
+              URL=$(gcloud run services describe "$SERVICE_NAME" \
+                --region "${{ env.REGION }}" \
+                --project "${{ secrets.GCP_PROJECT_ID }}" \
+                --format 'value(status.url)')
+              
+              HEALTH=$(curl -s -w "%{http_code}" -o /dev/null \
+                -H "Authorization: Bearer ${ID_TOKEN}" \
+                "${URL}/health" || echo "000")
+              
+              if [ "$HEALTH" == "200" ]; then
+                echo "✓ ${service} staging is healthy"
+              else
+                echo "✗ ${service} staging health check failed: ${HEALTH}"
+                ALL_HEALTHY=false
+              fi
+            fi
+          done
+          
+          if [ "$ALL_HEALTHY" == "false" ]; then
+            echo "::error::Staging environment is not healthy - cannot proceed with production deployment"
+            exit 1
+          fi
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Prepare deployment
+  # ============================================
+  prepare:
+    name: Prepare Production Deployment
+    runs-on: ubuntu-latest
+    needs: [approval, validate]
+    outputs:
+      services: ${{ steps.services.outputs.list }}
+      image_tag: ${{ steps.tag.outputs.value }}
+    
+    steps:
+      - name: Determine Services
+        id: services
+        run: |
+          SERVICES="${{ inputs.services }}"
+          if [ -z "$SERVICES" ] || [ "$SERVICES" == "all" ]; then
+            SERVICES="python,node,go"
+          fi
+          echo "list=${SERVICES}" >> $GITHUB_OUTPUT
+          echo "Services to deploy: ${SERVICES}"
+
+      - name: Determine Image Tag
+        id: tag
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="latest-staging"
+          fi
+          echo "value=${TAG}" >> $GITHUB_OUTPUT
+          echo "Using image tag: ${TAG}"
+
+  # ============================================
+  # Tag images for production
+  # ============================================
+  tag-images:
+    name: Tag Images for Production
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      python_image: ${{ steps.python.outputs.image }}
+      node_image: ${{ steps.node.outputs.image }}
+      go_image: ${{ steps.go.outputs.image }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+          setup_docker: 'true'
+
+      - name: Tag Python Image
+        id: python
+        if: contains(needs.prepare.outputs.services, 'python')
+        run: |
+          SOURCE_TAG="${{ needs.prepare.outputs.image_tag }}"
+          PROD_TAG="prod-${{ github.sha }}"
+          VERSION_TAG="${{ github.event.release.tag_name || 'v1.0.0' }}"
+          
+          IMAGE_BASE="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/nexusforge-docker/python"
+          SOURCE_IMAGE="${IMAGE_BASE}:${SOURCE_TAG}"
+          PROD_IMAGE="${IMAGE_BASE}:${PROD_TAG}"
+          
+          docker pull "$SOURCE_IMAGE"
+          docker tag "$SOURCE_IMAGE" "$PROD_IMAGE"
+          docker tag "$SOURCE_IMAGE" "${IMAGE_BASE}:${VERSION_TAG}"
+          docker tag "$SOURCE_IMAGE" "${IMAGE_BASE}:latest"
+          
+          docker push "$PROD_IMAGE"
+          docker push "${IMAGE_BASE}:${VERSION_TAG}"
+          docker push "${IMAGE_BASE}:latest"
+          
+          echo "image=${PROD_IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Tag Node.js Image
+        id: node
+        if: contains(needs.prepare.outputs.services, 'node')
+        run: |
+          SOURCE_TAG="${{ needs.prepare.outputs.image_tag }}"
+          PROD_TAG="prod-${{ github.sha }}"
+          VERSION_TAG="${{ github.event.release.tag_name || 'v1.0.0' }}"
+          
+          IMAGE_BASE="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/nexusforge-docker/node"
+          SOURCE_IMAGE="${IMAGE_BASE}:${SOURCE_TAG}"
+          PROD_IMAGE="${IMAGE_BASE}:${PROD_TAG}"
+          
+          docker pull "$SOURCE_IMAGE"
+          docker tag "$SOURCE_IMAGE" "$PROD_IMAGE"
+          docker tag "$SOURCE_IMAGE" "${IMAGE_BASE}:${VERSION_TAG}"
+          docker tag "$SOURCE_IMAGE" "${IMAGE_BASE}:latest"
+          
+          docker push "$PROD_IMAGE"
+          docker push "${IMAGE_BASE}:${VERSION_TAG}"
+          docker push "${IMAGE_BASE}:latest"
+          
+          echo "image=${PROD_IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Tag Go Image
+        id: go
+        if: contains(needs.prepare.outputs.services, 'go')
+        run: |
+          SOURCE_TAG="${{ needs.prepare.outputs.image_tag }}"
+          PROD_TAG="prod-${{ github.sha }}"
+          VERSION_TAG="${{ github.event.release.tag_name || 'v1.0.0' }}"
+          
+          IMAGE_BASE="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/nexusforge-docker/go"
+          SOURCE_IMAGE="${IMAGE_BASE}:${SOURCE_TAG}"
+          PROD_IMAGE="${IMAGE_BASE}:${PROD_TAG}"
+          
+          docker pull "$SOURCE_IMAGE"
+          docker tag "$SOURCE_IMAGE" "$PROD_IMAGE"
+          docker tag "$SOURCE_IMAGE" "${IMAGE_BASE}:${VERSION_TAG}"
+          docker tag "$SOURCE_IMAGE" "${IMAGE_BASE}:latest"
+          
+          docker push "$PROD_IMAGE"
+          docker push "${IMAGE_BASE}:${VERSION_TAG}"
+          docker push "${IMAGE_BASE}:latest"
+          
+          echo "image=${PROD_IMAGE}" >> $GITHUB_OUTPUT
+
+  # ============================================
+  # Deploy canary - Python
+  # ============================================
+  deploy-python-canary:
+    name: Deploy Python Canary
+    if: contains(needs.prepare.outputs.services, 'python')
+    needs: [prepare, tag-images]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      service: 'python'
+      image: ${{ needs.tag-images.outputs.python_image }}
+      environment: 'prod'
+      port: 8000
+      min_instances: 2
+      max_instances: 20
+      memory: '2Gi'
+      cpu: 2
+      allow_unauthenticated: false
+      traffic_split: ${{ inputs.canary_percentage || 25 }}
+      run_smoke_tests: true
+      rollback_on_failure: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+      REDIS_URL: ${{ secrets.PROD_REDIS_URL }}
+      SECRET_KEY: ${{ secrets.PROD_SECRET_KEY }}
+
+  # ============================================
+  # Deploy canary - Node.js
+  # ============================================
+  deploy-node-canary:
+    name: Deploy Node.js Canary
+    if: contains(needs.prepare.outputs.services, 'node')
+    needs: [prepare, tag-images]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      service: 'node'
+      image: ${{ needs.tag-images.outputs.node_image }}
+      environment: 'prod'
+      port: 3000
+      min_instances: 2
+      max_instances: 20
+      memory: '2Gi'
+      cpu: 2
+      allow_unauthenticated: false
+      traffic_split: ${{ inputs.canary_percentage || 25 }}
+      run_smoke_tests: true
+      rollback_on_failure: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+      REDIS_URL: ${{ secrets.PROD_REDIS_URL }}
+      SECRET_KEY: ${{ secrets.PROD_SECRET_KEY }}
+
+  # ============================================
+  # Deploy canary - Go
+  # ============================================
+  deploy-go-canary:
+    name: Deploy Go Canary
+    if: contains(needs.prepare.outputs.services, 'go')
+    needs: [prepare, tag-images]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      service: 'go'
+      image: ${{ needs.tag-images.outputs.go_image }}
+      environment: 'prod'
+      port: 8080
+      min_instances: 2
+      max_instances: 20
+      memory: '2Gi'
+      cpu: 2
+      allow_unauthenticated: false
+      traffic_split: ${{ inputs.canary_percentage || 25 }}
+      run_smoke_tests: true
+      rollback_on_failure: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+      REDIS_URL: ${{ secrets.PROD_REDIS_URL }}
+      SECRET_KEY: ${{ secrets.PROD_SECRET_KEY }}
+
+  # ============================================
+  # Monitor canary deployment
+  # ============================================
+  monitor-canary:
+    name: Monitor Canary Deployment
+    runs-on: ubuntu-latest
+    needs: [deploy-python-canary, deploy-node-canary, deploy-go-canary]
+    if: always() && (needs.deploy-python-canary.result == 'success' || needs.deploy-node-canary.result == 'success' || needs.deploy-go-canary.result == 'success')
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      canary_healthy: ${{ steps.monitor.outputs.healthy }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Monitor Canary Health
+        id: monitor
+        run: |
+          echo "::group::Monitor canary deployment"
+          
+          DURATION_MINUTES=${{ inputs.canary_duration || 10 }}
+          DURATION_SECONDS=$((DURATION_MINUTES * 60))
+          CHECK_INTERVAL=30
+          CHECKS=$((DURATION_SECONDS / CHECK_INTERVAL))
+          
+          echo "Monitoring canary for ${DURATION_MINUTES} minutes (${CHECKS} checks)"
+          
+          ID_TOKEN=$(gcloud auth print-identity-token)
+          ALL_HEALTHY=true
+          
+          for ((i=1; i<=CHECKS; i++)); do
+            echo "Check ${i}/${CHECKS}..."
+            
+            # Check each service
+            SERVICES=("python" "node" "go")
+            for service in "${SERVICES[@]}"; do
+              SERVICE_NAME="${{ env.TEAM_NAME }}-${service}-prod"
+              
+              if gcloud run services describe "$SERVICE_NAME" \
+                --region "${{ env.REGION }}" \
+                --project "${{ secrets.GCP_PROJECT_ID }}" &>/dev/null; then
+                
+                URL=$(gcloud run services describe "$SERVICE_NAME" \
+                  --region "${{ env.REGION }}" \
+                  --project "${{ secrets.GCP_PROJECT_ID }}" \
+                  --format 'value(status.url)')
+                
+                HEALTH=$(curl -s -w "%{http_code}" -o /dev/null \
+                  -H "Authorization: Bearer ${ID_TOKEN}" \
+                  "${URL}/health" || echo "000")
+                
+                if [ "$HEALTH" != "200" ]; then
+                  echo "✗ ${service} health check failed: ${HEALTH}"
+                  ALL_HEALTHY=false
+                  break 2
+                fi
+              fi
+            done
+            
+            if [ $i -lt $CHECKS ]; then
+              sleep $CHECK_INTERVAL
+            fi
+          done
+          
+          if [ "$ALL_HEALTHY" == "true" ]; then
+            echo "healthy=true" >> $GITHUB_OUTPUT
+            echo "✓ Canary deployment is healthy"
+          else
+            echo "healthy=false" >> $GITHUB_OUTPUT
+            echo "✗ Canary deployment has issues"
+          fi
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Promote canary to 100%
+  # ============================================
+  promote-canary:
+    name: Promote Canary to Production
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-python-canary, deploy-node-canary, deploy-go-canary, monitor-canary]
+    if: needs.monitor-canary.outputs.canary_healthy == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: production-promote
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Promote Canary
+        run: |
+          echo "::group::Promote canary to 100% traffic"
+          
+          SERVICES="${{ needs.prepare.outputs.services }}"
+          IFS=',' read -ra SERVICE_LIST <<< "$SERVICES"
+          
+          for service in "${SERVICE_LIST[@]}"; do
+            SERVICE_NAME="${{ env.TEAM_NAME }}-${service}-prod"
+            
+            echo "Promoting ${service} to 100% traffic..."
+            
+            # Get latest revision
+            LATEST_REVISION=$(gcloud run services describe "$SERVICE_NAME" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}" \
+              --format 'value(status.latestCreatedRevisionName)')
+            
+            # Route 100% traffic to latest revision
+            gcloud run services update-traffic "$SERVICE_NAME" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}" \
+              --to-revisions "${LATEST_REVISION}=100" \
+              --quiet
+            
+            echo "✓ ${service} promoted to 100%"
+          done
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Final summary
+  # ============================================
+  notify:
+    name: Production Deployment Complete
+    runs-on: ubuntu-latest
+    needs: [promote-canary]
+    if: always()
+    
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## 🚀 Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "✅ All services deployed and promoted to production" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release:** ${{ github.event.release.tag_name || 'Manual Deployment' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Canary %:** ${{ inputs.canary_percentage || 25 }}%" >> $GITHUB_STEP_SUMMARY
+          echo "- **Monitor Duration:** ${{ inputs.canary_duration || 10 }} minutes" >> $GITHUB_STEP_SUMMARY

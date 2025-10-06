@@ -1,0 +1,406 @@
+name: 03 - Deploy to Staging
+
+on:
+  push:
+    branches:
+      - staging
+      - main
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to deploy (comma-separated: python,node,go or "all")'
+        required: false
+        type: string
+        default: 'all'
+      image_tag:
+        description: 'Image tag to deploy (default: latest from dev)'
+        required: false
+        type: string
+        default: ''
+
+env:
+  ENVIRONMENT: staging
+  REGION: us-central1
+  TEAM_NAME: nexusforge
+
+jobs:
+  # ============================================
+  # Require approval for staging deployment
+  # ============================================
+  approval:
+    name: Approval Required
+    runs-on: ubuntu-latest
+    environment:
+      name: staging-approval
+    steps:
+      - name: Approval Gate
+        run: |
+          echo "## ⏸️ Staging Deployment Approval" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Deployment to staging environment approved by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "Proceeding with deployment..." >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # Determine services to deploy
+  # ============================================
+  prepare:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    needs: approval
+    outputs:
+      services: ${{ steps.services.outputs.list }}
+      image_tag: ${{ steps.tag.outputs.value }}
+    
+    steps:
+      - name: Determine Services
+        id: services
+        run: |
+          SERVICES="${{ inputs.services }}"
+          if [ -z "$SERVICES" ] || [ "$SERVICES" == "all" ]; then
+            SERVICES="python,node,go"
+          fi
+          echo "list=${SERVICES}" >> $GITHUB_OUTPUT
+          echo "Services to deploy: ${SERVICES}"
+
+      - name: Determine Image Tag
+        id: tag
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="latest-dev"
+          fi
+          echo "value=${TAG}" >> $GITHUB_OUTPUT
+          echo "Using image tag: ${TAG}"
+
+  # ============================================
+  # Security scan on staging images
+  # ============================================
+  security-scan:
+    name: Security Scan
+    needs: prepare
+    uses: ./.github/workflows/reusable-security-scan.yml
+    with:
+      scan_type: 'code'
+      severity: 'CRITICAL,HIGH'
+      fail_on_severity: 'CRITICAL'
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+  # ============================================
+  # Tag images for staging
+  # ============================================
+  tag-images:
+    name: Tag Images for Staging
+    runs-on: ubuntu-latest
+    needs: [prepare, security-scan]
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      python_image: ${{ steps.python.outputs.image }}
+      node_image: ${{ steps.node.outputs.image }}
+      go_image: ${{ steps.go.outputs.image }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+          setup_docker: 'true'
+
+      - name: Tag Python Image
+        id: python
+        if: contains(needs.prepare.outputs.services, 'python')
+        run: |
+          SOURCE_TAG="${{ needs.prepare.outputs.image_tag }}"
+          STAGING_TAG="staging-${{ github.sha }}"
+          
+          IMAGE_BASE="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/nexusforge-docker/python"
+          SOURCE_IMAGE="${IMAGE_BASE}:${SOURCE_TAG}"
+          STAGING_IMAGE="${IMAGE_BASE}:${STAGING_TAG}"
+          
+          # Pull source image
+          docker pull "$SOURCE_IMAGE"
+          
+          # Tag for staging
+          docker tag "$SOURCE_IMAGE" "$STAGING_IMAGE"
+          docker tag "$SOURCE_IMAGE" "${IMAGE_BASE}:latest-staging"
+          
+          # Push staging tags
+          docker push "$STAGING_IMAGE"
+          docker push "${IMAGE_BASE}:latest-staging"
+          
+          echo "image=${STAGING_IMAGE}" >> $GITHUB_OUTPUT
+          echo "Python image tagged: ${STAGING_IMAGE}"
+
+      - name: Tag Node.js Image
+        id: node
+        if: contains(needs.prepare.outputs.services, 'node')
+        run: |
+          SOURCE_TAG="${{ needs.prepare.outputs.image_tag }}"
+          STAGING_TAG="staging-${{ github.sha }}"
+          
+          IMAGE_BASE="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/nexusforge-docker/node"
+          SOURCE_IMAGE="${IMAGE_BASE}:${SOURCE_TAG}"
+          STAGING_IMAGE="${IMAGE_BASE}:${STAGING_TAG}"
+          
+          docker pull "$SOURCE_IMAGE"
+          docker tag "$SOURCE_IMAGE" "$STAGING_IMAGE"
+          docker tag "$SOURCE_IMAGE" "${IMAGE_BASE}:latest-staging"
+          
+          docker push "$STAGING_IMAGE"
+          docker push "${IMAGE_BASE}:latest-staging"
+          
+          echo "image=${STAGING_IMAGE}" >> $GITHUB_OUTPUT
+          echo "Node.js image tagged: ${STAGING_IMAGE}"
+
+      - name: Tag Go Image
+        id: go
+        if: contains(needs.prepare.outputs.services, 'go')
+        run: |
+          SOURCE_TAG="${{ needs.prepare.outputs.image_tag }}"
+          STAGING_TAG="staging-${{ github.sha }}"
+          
+          IMAGE_BASE="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/nexusforge-docker/go"
+          SOURCE_IMAGE="${IMAGE_BASE}:${SOURCE_TAG}"
+          STAGING_IMAGE="${IMAGE_BASE}:${STAGING_TAG}"
+          
+          docker pull "$SOURCE_IMAGE"
+          docker tag "$SOURCE_IMAGE" "$STAGING_IMAGE"
+          docker tag "$SOURCE_IMAGE" "${IMAGE_BASE}:latest-staging"
+          
+          docker push "$STAGING_IMAGE"
+          docker push "${IMAGE_BASE}:latest-staging"
+          
+          echo "image=${STAGING_IMAGE}" >> $GITHUB_OUTPUT
+          echo "Go image tagged: ${STAGING_IMAGE}"
+
+  # ============================================
+  # Deploy Python service
+  # ============================================
+  deploy-python:
+    name: Deploy Python
+    if: contains(needs.prepare.outputs.services, 'python')
+    needs: [prepare, tag-images]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      service: 'python'
+      image: ${{ needs.tag-images.outputs.python_image }}
+      environment: 'staging'
+      port: 8000
+      min_instances: 1
+      max_instances: 10
+      memory: '1Gi'
+      cpu: 2
+      allow_unauthenticated: false
+      run_smoke_tests: true
+      rollback_on_failure: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+      REDIS_URL: ${{ secrets.STAGING_REDIS_URL }}
+      SECRET_KEY: ${{ secrets.STAGING_SECRET_KEY }}
+
+  # ============================================
+  # Deploy Node.js service
+  # ============================================
+  deploy-node:
+    name: Deploy Node.js
+    if: contains(needs.prepare.outputs.services, 'node')
+    needs: [prepare, tag-images]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      service: 'node'
+      image: ${{ needs.tag-images.outputs.node_image }}
+      environment: 'staging'
+      port: 3000
+      min_instances: 1
+      max_instances: 10
+      memory: '1Gi'
+      cpu: 2
+      allow_unauthenticated: false
+      run_smoke_tests: true
+      rollback_on_failure: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+      REDIS_URL: ${{ secrets.STAGING_REDIS_URL }}
+      SECRET_KEY: ${{ secrets.STAGING_SECRET_KEY }}
+
+  # ============================================
+  # Deploy Go service
+  # ============================================
+  deploy-go:
+    name: Deploy Go
+    if: contains(needs.prepare.outputs.services, 'go')
+    needs: [prepare, tag-images]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      service: 'go'
+      image: ${{ needs.tag-images.outputs.go_image }}
+      environment: 'staging'
+      port: 8080
+      min_instances: 1
+      max_instances: 10
+      memory: '1Gi'
+      cpu: 2
+      allow_unauthenticated: false
+      run_smoke_tests: true
+      rollback_on_failure: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+      REDIS_URL: ${{ secrets.STAGING_REDIS_URL }}
+      SECRET_KEY: ${{ secrets.STAGING_SECRET_KEY }}
+
+  # ============================================
+  # Run integration tests
+  # ============================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-python, deploy-node, deploy-go]
+    if: always() && (needs.deploy-python.result == 'success' || needs.deploy-node.result == 'success' || needs.deploy-go.result == 'success')
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Run Integration Tests
+        run: |
+          echo "::group::Run staging integration tests"
+          
+          # Get ID token for authenticated requests
+          ID_TOKEN=$(gcloud auth print-identity-token)
+          
+          # Test Python service
+          if [ "${{ needs.deploy-python.result }}" == "success" ]; then
+            PYTHON_URL="${{ needs.deploy-python.outputs.service_url }}"
+            echo "Testing Python service at ${PYTHON_URL}"
+            
+            RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: Bearer ${ID_TOKEN}" "${PYTHON_URL}/health" || echo "000")
+            if [ "$RESPONSE" == "200" ]; then
+              echo "✓ Python service health check passed"
+            else
+              echo "✗ Python service health check failed: ${RESPONSE}"
+            fi
+          fi
+          
+          # Test Node.js service
+          if [ "${{ needs.deploy-node.result }}" == "success" ]; then
+            NODE_URL="${{ needs.deploy-node.outputs.service_url }}"
+            echo "Testing Node.js service at ${NODE_URL}"
+            
+            RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: Bearer ${ID_TOKEN}" "${NODE_URL}/health" || echo "000")
+            if [ "$RESPONSE" == "200" ]; then
+              echo "✓ Node.js service health check passed"
+            else
+              echo "✗ Node.js service health check failed: ${RESPONSE}"
+            fi
+          fi
+          
+          # Test Go service
+          if [ "${{ needs.deploy-go.result }}" == "success" ]; then
+            GO_URL="${{ needs.deploy-go.outputs.service_url }}"
+            echo "Testing Go service at ${GO_URL}"
+            
+            RESPONSE=$(curl -s -w "%{http_code}" -H "Authorization: Bearer ${ID_TOKEN}" "${GO_URL}/health" || echo "000")
+            if [ "$RESPONSE" == "200" ]; then
+              echo "✓ Go service health check passed"
+            else
+              echo "✗ Go service health check failed: ${RESPONSE}"
+            fi
+          fi
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Notify on completion
+  # ============================================
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy-python, deploy-node, deploy-go, integration-tests]
+    if: always()
+    
+    steps:
+      - name: Generate Deployment Summary
+        run: |
+          echo "## 🎯 Staging Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Python status
+          if [ "${{ needs.deploy-python.result }}" != "skipped" ]; then
+            if [ "${{ needs.deploy-python.result }}" == "success" ]; then
+              echo "- ✅ Python: Deployed successfully" >> $GITHUB_STEP_SUMMARY
+              echo "  - URL: ${{ needs.deploy-python.outputs.service_url }}" >> $GITHUB_STEP_SUMMARY
+              echo "  - Revision: \`${{ needs.deploy-python.outputs.revision }}\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ❌ Python: Deployment failed" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          # Node status
+          if [ "${{ needs.deploy-node.result }}" != "skipped" ]; then
+            if [ "${{ needs.deploy-node.result }}" == "success" ]; then
+              echo "- ✅ Node.js: Deployed successfully" >> $GITHUB_STEP_SUMMARY
+              echo "  - URL: ${{ needs.deploy-node.outputs.service_url }}" >> $GITHUB_STEP_SUMMARY
+              echo "  - Revision: \`${{ needs.deploy-node.outputs.revision }}\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ❌ Node.js: Deployment failed" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          # Go status
+          if [ "${{ needs.deploy-go.result }}" != "skipped" ]; then
+            if [ "${{ needs.deploy-go.result }}" == "success" ]; then
+              echo "- ✅ Go: Deployed successfully" >> $GITHUB_STEP_SUMMARY
+              echo "  - URL: ${{ needs.deploy-go.outputs.service_url }}" >> $GITHUB_STEP_SUMMARY
+              echo "  - Revision: \`${{ needs.deploy-go.outputs.revision }}\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ❌ Go: Deployment failed" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Integration Tests" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.integration-tests.result }}" == "success" ]; then
+            echo "✅ All integration tests passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Integration tests failed or were skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Author:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** \`staging\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Approved by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY

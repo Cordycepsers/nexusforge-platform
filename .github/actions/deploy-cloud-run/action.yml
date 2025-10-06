@@ -1,0 +1,458 @@
+name: 'Deploy to Cloud Run'
+description: 'Deploy containerized service to Google Cloud Run with advanced configuration'
+author: 'NexusForge Team'
+
+inputs:
+  service_name:
+    description: 'Cloud Run service name'
+    required: true
+  image:
+    description: 'Docker image URL with tag or digest'
+    required: true
+  region:
+    description: 'GCP Region for deployment'
+    required: true
+  project_id:
+    description: 'GCP Project ID'
+    required: true
+  service_account:
+    description: 'Service account email for the Cloud Run service'
+    required: true
+  environment:
+    description: 'Environment name (dev, staging, prod)'
+    required: true
+  port:
+    description: 'Container port'
+    required: false
+    default: '8080'
+  min_instances:
+    description: 'Minimum number of instances'
+    required: false
+    default: '0'
+  max_instances:
+    description: 'Maximum number of instances'
+    required: false
+    default: '10'
+  memory:
+    description: 'Memory allocation (e.g., 512Mi, 1Gi)'
+    required: false
+    default: '512Mi'
+  cpu:
+    description: 'CPU allocation'
+    required: false
+    default: '1'
+  timeout:
+    description: 'Request timeout in seconds'
+    required: false
+    default: '300'
+  concurrency:
+    description: 'Maximum concurrent requests per instance'
+    required: false
+    default: '80'
+  env_vars:
+    description: 'Environment variables (KEY=VALUE format, one per line)'
+    required: false
+    default: ''
+  secrets:
+    description: 'Secret references (KEY=SECRET_NAME:VERSION format, one per line)'
+    required: false
+    default: ''
+  vpc_connector:
+    description: 'VPC connector name for private connectivity'
+    required: false
+    default: ''
+  vpc_egress:
+    description: 'VPC egress setting (all-traffic, private-ranges-only)'
+    required: false
+    default: 'private-ranges-only'
+  ingress:
+    description: 'Ingress settings (all, internal, internal-and-cloud-load-balancing)'
+    required: false
+    default: 'all'
+  allow_unauthenticated:
+    description: 'Allow unauthenticated access'
+    required: false
+    default: 'false'
+  traffic_split:
+    description: 'Traffic percentage for this revision (0-100)'
+    required: false
+    default: '100'
+  revision_suffix:
+    description: 'Revision name suffix'
+    required: false
+    default: ''
+  labels:
+    description: 'Resource labels (KEY=VALUE format, one per line)'
+    required: false
+    default: ''
+  cloudsql_instances:
+    description: 'Cloud SQL instance connection names (comma-separated)'
+    required: false
+    default: ''
+  enable_execution_logs:
+    description: 'Enable detailed execution logs'
+    required: false
+    default: 'true'
+
+outputs:
+  service_url:
+    description: 'Cloud Run service URL'
+    value: ${{ steps.deploy.outputs.url }}
+  revision:
+    description: 'Deployed revision name'
+    value: ${{ steps.deploy.outputs.revision }}
+  traffic:
+    description: 'Traffic split configuration'
+    value: ${{ steps.traffic.outputs.config }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ============================================
+    # Validate inputs
+    # ============================================
+    - name: Validate Inputs
+      shell: bash
+      run: |
+        echo "::group::Validate deployment inputs"
+        
+        # Validate traffic split
+        if [ "${{ inputs.traffic_split }}" -lt 0 ] || [ "${{ inputs.traffic_split }}" -gt 100 ]; then
+          echo "::error::Traffic split must be between 0 and 100"
+          exit 1
+        fi
+        
+        # Validate memory format
+        if [[ ! "${{ inputs.memory }}" =~ ^[0-9]+(Mi|Gi)$ ]]; then
+          echo "::error::Memory must be in format like 512Mi or 1Gi"
+          exit 1
+        fi
+        
+        # Validate CPU
+        if [[ ! "${{ inputs.cpu }}" =~ ^[0-9]+$ ]]; then
+          echo "::error::CPU must be a number"
+          exit 1
+        fi
+        
+        echo "✓ All inputs validated"
+        echo "::endgroup::"
+
+    # ============================================
+    # Prepare deployment configuration
+    # ============================================
+    - name: Prepare Deployment Configuration
+      id: config
+      shell: bash
+      run: |
+        echo "::group::Prepare deployment configuration"
+        
+        # Generate revision suffix if not provided
+        if [ -z "${{ inputs.revision_suffix }}" ]; then
+          REVISION_SUFFIX="${{ github.sha }}-$(date +%s)"
+        else
+          REVISION_SUFFIX="${{ inputs.revision_suffix }}"
+        fi
+        echo "revision_suffix=${REVISION_SUFFIX}" >> $GITHUB_OUTPUT
+        
+        # Prepare environment variables file
+        ENV_FILE=$(mktemp)
+        if [ -n "${{ inputs.env_vars }}" ]; then
+          echo "${{ inputs.env_vars }}" > "$ENV_FILE"
+        fi
+        
+        # Add standard environment variables
+        cat >> "$ENV_FILE" << EOF
+        ENVIRONMENT=${{ inputs.environment }}
+        GCP_PROJECT=${{ inputs.project_id }}
+        GCP_REGION=${{ inputs.region }}
+        SERVICE_NAME=${{ inputs.service_name }}
+        DEPLOYMENT_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+        GIT_COMMIT=${{ github.sha }}
+        GIT_BRANCH=${{ github.ref_name }}
+        EOF
+        
+        echo "env_file=${ENV_FILE}" >> $GITHUB_OUTPUT
+        
+        # Prepare secrets file
+        SECRETS_FILE=$(mktemp)
+        if [ -n "${{ inputs.secrets }}" ]; then
+          echo "${{ inputs.secrets }}" > "$SECRETS_FILE"
+        fi
+        echo "secrets_file=${SECRETS_FILE}" >> $GITHUB_OUTPUT
+        
+        # Prepare labels file
+        LABELS_FILE=$(mktemp)
+        cat > "$LABELS_FILE" << EOF
+        environment=${{ inputs.environment }}
+        service=${{ inputs.service_name }}
+        managed-by=github-actions
+        git-commit=${{ github.sha }}
+        EOF
+        
+        if [ -n "${{ inputs.labels }}" ]; then
+          echo "${{ inputs.labels }}" >> "$LABELS_FILE"
+        fi
+        echo "labels_file=${LABELS_FILE}" >> $GITHUB_OUTPUT
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Build gcloud deploy command
+    # ============================================
+    - name: Build Deploy Command
+      id: command
+      shell: bash
+      run: |
+        echo "::group::Build gcloud deploy command"
+        
+        # Start building the command
+        CMD="gcloud run deploy ${{ inputs.service_name }}"
+        CMD="${CMD} --image ${{ inputs.image }}"
+        CMD="${CMD} --region ${{ inputs.region }}"
+        CMD="${CMD} --platform managed"
+        CMD="${CMD} --project ${{ inputs.project_id }}"
+        
+        # Service account
+        CMD="${CMD} --service-account ${{ inputs.service_account }}"
+        
+        # Resource limits
+        CMD="${CMD} --memory ${{ inputs.memory }}"
+        CMD="${CMD} --cpu ${{ inputs.cpu }}"
+        CMD="${CMD} --timeout ${{ inputs.timeout }}"
+        CMD="${CMD} --concurrency ${{ inputs.concurrency }}"
+        
+        # Scaling
+        CMD="${CMD} --min-instances ${{ inputs.min_instances }}"
+        CMD="${CMD} --max-instances ${{ inputs.max_instances }}"
+        
+        # Port
+        CMD="${CMD} --port ${{ inputs.port }}"
+        
+        # Ingress
+        CMD="${CMD} --ingress ${{ inputs.ingress }}"
+        
+        # Revision suffix
+        CMD="${CMD} --revision-suffix ${{ steps.config.outputs.revision_suffix }}"
+        
+        # VPC connector
+        if [ -n "${{ inputs.vpc_connector }}" ]; then
+          CMD="${CMD} --vpc-connector ${{ inputs.vpc_connector }}"
+          CMD="${CMD} --vpc-egress ${{ inputs.vpc_egress }}"
+        fi
+        
+        # Cloud SQL
+        if [ -n "${{ inputs.cloudsql_instances }}" ]; then
+          CMD="${CMD} --add-cloudsql-instances ${{ inputs.cloudsql_instances }}"
+        fi
+        
+        # Environment variables
+        if [ -s "${{ steps.config.outputs.env_file }}" ]; then
+          # Convert to comma-separated KEY=VALUE pairs
+          ENV_VARS=$(cat "${{ steps.config.outputs.env_file }}" | tr '\n' ',' | sed 's/,$//')
+          CMD="${CMD} --set-env-vars \"${ENV_VARS}\""
+        fi
+        
+        # Secrets
+        if [ -s "${{ steps.config.outputs.secrets_file }}" ]; then
+          SECRETS=$(cat "${{ steps.config.outputs.secrets_file }}" | tr '\n' ',' | sed 's/,$//')
+          CMD="${CMD} --set-secrets \"${SECRETS}\""
+        fi
+        
+        # Labels
+        if [ -s "${{ steps.config.outputs.labels_file }}" ]; then
+          LABELS=$(cat "${{ steps.config.outputs.labels_file }}" | tr '\n' ',' | sed 's/,$//')
+          CMD="${CMD} --labels \"${LABELS}\""
+        fi
+        
+        # Execution logs
+        if [ "${{ inputs.enable_execution_logs }}" == "true" ]; then
+          CMD="${CMD} --execution-environment gen2"
+        fi
+        
+        # No traffic flag for canary deployments
+        if [ "${{ inputs.traffic_split }}" != "100" ]; then
+          CMD="${CMD} --no-traffic"
+        fi
+        
+        # Authentication
+        if [ "${{ inputs.allow_unauthenticated }}" == "true" ]; then
+          CMD="${CMD} --allow-unauthenticated"
+        else
+          CMD="${CMD} --no-allow-unauthenticated"
+        fi
+        
+        # Format and quiet
+        CMD="${CMD} --format json"
+        CMD="${CMD} --quiet"
+        
+        echo "deploy_command=${CMD}" >> $GITHUB_OUTPUT
+        
+        echo "Deploy command prepared"
+        echo "::endgroup::"
+
+    # ============================================
+    # Deploy to Cloud Run
+    # ============================================
+    - name: Deploy to Cloud Run
+      id: deploy
+      shell: bash
+      run: |
+        echo "::group::Deploy to Cloud Run"
+        
+        echo "Deploying ${{ inputs.service_name }} to ${{ inputs.region }}..."
+        echo "Image: ${{ inputs.image }}"
+        echo "Environment: ${{ inputs.environment }}"
+        
+        # Execute deployment
+        DEPLOY_OUTPUT=$(eval "${{ steps.command.outputs.deploy_command }}")
+        
+        # Extract service URL and revision
+        SERVICE_URL=$(echo "$DEPLOY_OUTPUT" | jq -r '.status.url // empty')
+        REVISION=$(echo "$DEPLOY_OUTPUT" | jq -r '.status.latestCreatedRevisionName // empty')
+        
+        echo "url=${SERVICE_URL}" >> $GITHUB_OUTPUT
+        echo "revision=${REVISION}" >> $GITHUB_OUTPUT
+        
+        echo "✓ Deployment successful"
+        echo "Service URL: ${SERVICE_URL}"
+        echo "Revision: ${REVISION}"
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Configure traffic split
+    # ============================================
+    - name: Configure Traffic Split
+      id: traffic
+      if: inputs.traffic_split != '100'
+      shell: bash
+      run: |
+        echo "::group::Configure traffic split"
+        
+        echo "Setting traffic split to ${{ inputs.traffic_split }}% for revision ${{ steps.deploy.outputs.revision }}"
+        
+        gcloud run services update-traffic ${{ inputs.service_name }} \
+          --region ${{ inputs.region }} \
+          --project ${{ inputs.project_id }} \
+          --to-revisions ${{ steps.deploy.outputs.revision }}=${{ inputs.traffic_split }} \
+          --quiet
+        
+        # Get current traffic configuration
+        TRAFFIC_CONFIG=$(gcloud run services describe ${{ inputs.service_name }} \
+          --region ${{ inputs.region }} \
+          --project ${{ inputs.project_id }} \
+          --format json | jq -r '.status.traffic')
+        
+        echo "config=${TRAFFIC_CONFIG}" >> $GITHUB_OUTPUT
+        echo "Traffic split configured"
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Wait for service to be ready
+    # ============================================
+    - name: Wait for Service Ready
+      shell: bash
+      run: |
+        echo "::group::Wait for service to be ready"
+        
+        MAX_ATTEMPTS=30
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          STATUS=$(gcloud run services describe ${{ inputs.service_name }} \
+            --region ${{ inputs.region }} \
+            --project ${{ inputs.project_id }} \
+            --format 'value(status.conditions[0].status)')
+          
+          if [ "$STATUS" == "True" ]; then
+            echo "✓ Service is ready"
+            break
+          fi
+          
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "Waiting for service to be ready... (${ATTEMPT}/${MAX_ATTEMPTS})"
+          sleep 10
+        done
+        
+        if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+          echo "::error::Service failed to become ready within timeout"
+          exit 1
+        fi
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Health check
+    # ============================================
+    - name: Health Check
+      shell: bash
+      run: |
+        echo "::group::Perform health check"
+        
+        SERVICE_URL="${{ steps.deploy.outputs.url }}"
+        
+        if [ -n "$SERVICE_URL" ]; then
+          echo "Testing service at ${SERVICE_URL}/health"
+          
+          # Get ID token for authenticated request
+          if [ "${{ inputs.allow_unauthenticated }}" != "true" ]; then
+            ID_TOKEN=$(gcloud auth print-identity-token)
+            HEALTH_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${ID_TOKEN}" "${SERVICE_URL}/health" || echo "000")
+          else
+            HEALTH_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/health" || echo "000")
+          fi
+          
+          if [ "$HEALTH_RESPONSE" == "200" ] || [ "$HEALTH_RESPONSE" == "404" ]; then
+            echo "✓ Service is responding"
+          else
+            echo "::warning::Health check returned status code: ${HEALTH_RESPONSE}"
+          fi
+        fi
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Generate deployment summary
+    # ============================================
+    - name: Generate Deployment Summary
+      shell: bash
+      run: |
+        echo "### Cloud Run Deployment Complete 🚀" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Service | \`${{ inputs.service_name }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Environment | \`${{ inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Region | \`${{ inputs.region }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Image | \`${{ inputs.image }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Revision | \`${{ steps.deploy.outputs.revision }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| URL | [${{ steps.deploy.outputs.url }}](${{ steps.deploy.outputs.url }}) |" >> $GITHUB_STEP_SUMMARY
+        echo "| Traffic | ${{ inputs.traffic_split }}% |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "#### Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "- Memory: ${{ inputs.memory }}" >> $GITHUB_STEP_SUMMARY
+        echo "- CPU: ${{ inputs.cpu }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Min Instances: ${{ inputs.min_instances }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Max Instances: ${{ inputs.max_instances }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Concurrency: ${{ inputs.concurrency }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Timeout: ${{ inputs.timeout }}s" >> $GITHUB_STEP_SUMMARY
+
+    # ============================================
+    # Cleanup temporary files
+    # ============================================
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        rm -f "${{ steps.config.outputs.env_file }}" || true
+        rm -f "${{ steps.config.outputs.secrets_file }}" || true
+        rm -f "${{ steps.config.outputs.labels_file }}" || true
+
+    # ============================================
+    # Display success message
+    # ============================================
+    - name: Deployment Success
+      shell: bash
+      run: |
+        echo "::notice::Successfully deployed ${{ inputs.service_name }} to Cloud Run at ${{ steps.deploy.outputs.url }}"

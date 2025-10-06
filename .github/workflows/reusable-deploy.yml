@@ -1,0 +1,481 @@
+name: Reusable Deploy to Cloud Run
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: 'Service name (python, node, go)'
+        required: true
+        type: string
+      image:
+        description: 'Docker image URL with tag or digest'
+        required: true
+        type: string
+      environment:
+        description: 'Environment name (dev, staging, prod)'
+        required: true
+        type: string
+      region:
+        description: 'GCP Region'
+        required: false
+        type: string
+        default: 'us-central1'
+      port:
+        description: 'Container port'
+        required: false
+        type: number
+        default: 8080
+      min_instances:
+        description: 'Minimum instances'
+        required: false
+        type: number
+        default: 0
+      max_instances:
+        description: 'Maximum instances'
+        required: false
+        type: number
+        default: 10
+      memory:
+        description: 'Memory allocation'
+        required: false
+        type: string
+        default: '512Mi'
+      cpu:
+        description: 'CPU allocation'
+        required: false
+        type: number
+        default: 1
+      timeout:
+        description: 'Request timeout in seconds'
+        required: false
+        type: number
+        default: 300
+      concurrency:
+        description: 'Max concurrent requests per instance'
+        required: false
+        type: number
+        default: 80
+      allow_unauthenticated:
+        description: 'Allow unauthenticated access'
+        required: false
+        type: boolean
+        default: false
+      traffic_split:
+        description: 'Traffic percentage for this revision (0-100)'
+        required: false
+        type: number
+        default: 100
+      vpc_connector:
+        description: 'VPC connector name'
+        required: false
+        type: string
+        default: ''
+      cloudsql_instances:
+        description: 'Cloud SQL instance connection names (comma-separated)'
+        required: false
+        type: string
+        default: ''
+      run_smoke_tests:
+        description: 'Run smoke tests after deployment'
+        required: false
+        type: boolean
+        default: true
+      rollback_on_failure:
+        description: 'Rollback on deployment failure'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER:
+        required: true
+      GCP_SERVICE_ACCOUNT:
+        required: true
+      GCP_PROJECT_ID:
+        required: true
+      DATABASE_URL:
+        required: false
+      REDIS_URL:
+        required: false
+      SECRET_KEY:
+        required: false
+    outputs:
+      service_url:
+        description: 'Cloud Run service URL'
+        value: ${{ jobs.deploy.outputs.url }}
+      revision:
+        description: 'Deployed revision name'
+        value: ${{ jobs.deploy.outputs.revision }}
+      deployment_status:
+        description: 'Deployment status'
+        value: ${{ jobs.deploy.outputs.status }}
+
+env:
+  REGION: ${{ inputs.region }}
+  TEAM_NAME: nexusforge
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.service }} to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.deploy-service.outputs.service_url }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      url: ${{ steps.deploy-service.outputs.service_url }}
+      revision: ${{ steps.deploy-service.outputs.revision }}
+      status: ${{ steps.status.outputs.deployment_status }}
+    
+    steps:
+      # ============================================
+      # Checkout code (for actions)
+      # ============================================
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ============================================
+      # Setup GCP authentication
+      # ============================================
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      # ============================================
+      # Get current revision (for rollback)
+      # ============================================
+      - name: Get Current Revision
+        id: current
+        run: |
+          echo "::group::Get current serving revision"
+          
+          SERVICE_NAME="${{ env.TEAM_NAME }}-${{ inputs.service }}-${{ inputs.environment }}"
+          
+          # Check if service exists
+          if gcloud run services describe "$SERVICE_NAME" \
+            --region "${{ env.REGION }}" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --format json &>/dev/null; then
+            
+            # Get current serving revision
+            CURRENT_REVISION=$(gcloud run services describe "$SERVICE_NAME" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}" \
+              --format 'value(status.latestReadyRevisionName)')
+            
+            echo "current_revision=${CURRENT_REVISION}" >> $GITHUB_OUTPUT
+            echo "Current serving revision: ${CURRENT_REVISION}"
+          else
+            echo "Service does not exist yet - first deployment"
+            echo "current_revision=" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "::endgroup::"
+
+      # ============================================
+      # Prepare environment variables
+      # ============================================
+      - name: Prepare Environment Variables
+        id: env-vars
+        run: |
+          echo "::group::Prepare environment variables"
+          
+          # Create environment variables string
+          ENV_VARS="ENVIRONMENT=${{ inputs.environment }}
+          SERVICE_NAME=${{ inputs.service }}
+          GCP_PROJECT=${{ secrets.GCP_PROJECT_ID }}
+          GCP_REGION=${{ env.REGION }}"
+          
+          # Add optional secrets if provided
+          if [ -n "${{ secrets.DATABASE_URL }}" ]; then
+            ENV_VARS="${ENV_VARS}
+          DATABASE_URL=${{ secrets.DATABASE_URL }}"
+          fi
+          
+          if [ -n "${{ secrets.REDIS_URL }}" ]; then
+            ENV_VARS="${ENV_VARS}
+          REDIS_URL=${{ secrets.REDIS_URL }}"
+          fi
+          
+          if [ -n "${{ secrets.SECRET_KEY }}" ]; then
+            ENV_VARS="${ENV_VARS}
+          SECRET_KEY=${{ secrets.SECRET_KEY }}"
+          fi
+          
+          echo "env_vars<<EOF" >> $GITHUB_OUTPUT
+          echo "${ENV_VARS}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "Environment variables prepared"
+          echo "::endgroup::"
+
+      # ============================================
+      # Prepare resource labels
+      # ============================================
+      - name: Prepare Labels
+        id: labels
+        run: |
+          echo "::group::Prepare resource labels"
+          
+          LABELS="environment=${{ inputs.environment }}
+          service=${{ inputs.service }}
+          team=${{ env.TEAM_NAME }}
+          managed-by=github-actions
+          deployed-by=${GITHUB_ACTOR}
+          git-sha=${GITHUB_SHA:0:7}"
+          
+          echo "labels<<EOF" >> $GITHUB_OUTPUT
+          echo "${LABELS}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "::endgroup::"
+
+      # ============================================
+      # Deploy to Cloud Run
+      # ============================================
+      - name: Deploy to Cloud Run
+        id: deploy-service
+        uses: ./.github/actions/deploy-cloud-run
+        with:
+          service_name: ${{ env.TEAM_NAME }}-${{ inputs.service }}-${{ inputs.environment }}
+          image: ${{ inputs.image }}
+          region: ${{ env.REGION }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          environment: ${{ inputs.environment }}
+          port: ${{ inputs.port }}
+          min_instances: ${{ inputs.min_instances }}
+          max_instances: ${{ inputs.max_instances }}
+          memory: ${{ inputs.memory }}
+          cpu: ${{ inputs.cpu }}
+          timeout: ${{ inputs.timeout }}
+          concurrency: ${{ inputs.concurrency }}
+          env_vars: ${{ steps.env-vars.outputs.env_vars }}
+          labels: ${{ steps.labels.outputs.labels }}
+          vpc_connector: ${{ inputs.vpc_connector }}
+          cloudsql_instances: ${{ inputs.cloudsql_instances }}
+          ingress: 'all'
+          allow_unauthenticated: ${{ inputs.allow_unauthenticated }}
+          traffic_split: ${{ inputs.traffic_split }}
+
+      # ============================================
+      # Wait for deployment to stabilize
+      # ============================================
+      - name: Wait for Deployment
+        run: |
+          echo "::group::Wait for deployment to stabilize"
+          
+          echo "Waiting 30 seconds for deployment to stabilize..."
+          sleep 30
+          
+          echo "::endgroup::"
+
+      # ============================================
+      # Run smoke tests
+      # ============================================
+      - name: Run Smoke Tests
+        id: smoke-tests
+        if: inputs.run_smoke_tests
+        run: |
+          echo "::group::Run smoke tests"
+          
+          SERVICE_URL="${{ steps.deploy-service.outputs.service_url }}"
+          SUCCESS=true
+          
+          # Test health endpoint
+          echo "Testing health endpoint..."
+          if [ "${{ inputs.allow_unauthenticated }}" == "true" ]; then
+            HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/health" || echo "000")
+          else
+            ID_TOKEN=$(gcloud auth print-identity-token)
+            HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${ID_TOKEN}" "${SERVICE_URL}/health" || echo "000")
+          fi
+          
+          if [ "$HEALTH_STATUS" == "200" ]; then
+            echo "✓ Health check passed"
+          else
+            echo "✗ Health check failed with status: ${HEALTH_STATUS}"
+            SUCCESS=false
+          fi
+          
+          # Test root endpoint
+          echo "Testing root endpoint..."
+          if [ "${{ inputs.allow_unauthenticated }}" == "true" ]; then
+            ROOT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/" || echo "000")
+          else
+            ID_TOKEN=$(gcloud auth print-identity-token)
+            ROOT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${ID_TOKEN}" "${SERVICE_URL}/" || echo "000")
+          fi
+          
+          if [ "$ROOT_STATUS" == "200" ] || [ "$ROOT_STATUS" == "404" ]; then
+            echo "✓ Root endpoint is responding"
+          else
+            echo "✗ Root endpoint check failed with status: ${ROOT_STATUS}"
+            SUCCESS=false
+          fi
+          
+          if [ "$SUCCESS" == "true" ]; then
+            echo "smoke_tests_passed=true" >> $GITHUB_OUTPUT
+            echo "::notice::Smoke tests passed"
+          else
+            echo "smoke_tests_passed=false" >> $GITHUB_OUTPUT
+            echo "::warning::Smoke tests failed"
+          fi
+          
+          echo "::endgroup::"
+
+      # ============================================
+      # Rollback on failure
+      # ============================================
+      - name: Rollback on Failure
+        if: failure() && inputs.rollback_on_failure && steps.current.outputs.current_revision != ''
+        run: |
+          echo "::group::Rollback to previous revision"
+          
+          SERVICE_NAME="${{ env.TEAM_NAME }}-${{ inputs.service }}-${{ inputs.environment }}"
+          PREVIOUS_REVISION="${{ steps.current.outputs.current_revision }}"
+          
+          echo "Rolling back to revision: ${PREVIOUS_REVISION}"
+          
+          gcloud run services update-traffic "$SERVICE_NAME" \
+            --region "${{ env.REGION }}" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --to-revisions "${PREVIOUS_REVISION}=100" \
+            --quiet
+          
+          echo "::warning::Deployment failed - rolled back to ${PREVIOUS_REVISION}"
+          echo "::endgroup::"
+
+      # ============================================
+      # Set deployment status
+      # ============================================
+      - name: Set Deployment Status
+        id: status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "deployment_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "deployment_status=failed" >> $GITHUB_OUTPUT
+          fi
+
+      # ============================================
+      # Generate deployment summary
+      # ============================================
+      - name: Generate Deployment Summary
+        if: always()
+        run: |
+          STATUS_ICON="✅"
+          if [ "${{ steps.status.outputs.deployment_status }}" == "failed" ]; then
+            STATUS_ICON="❌"
+          fi
+          
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "${STATUS_ICON} **Status:** ${{ steps.status.outputs.deployment_status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | \`${{ inputs.service }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | \`${{ inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | \`${{ env.REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ inputs.image }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Revision | \`${{ steps.deploy-service.outputs.revision }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | [${{ steps.deploy-service.outputs.service_url }}](${{ steps.deploy-service.outputs.service_url }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Traffic | ${{ inputs.traffic_split }}% |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ inputs.run_smoke_tests }}" == "true" ]; then
+            echo "### Smoke Tests" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.smoke-tests.outputs.smoke_tests_passed }}" == "true" ]; then
+              echo "✅ All smoke tests passed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Smoke tests failed" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+  # ============================================
+  # Post-deployment validation
+  # ============================================
+  validate:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: success()
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Validate Service Configuration
+        run: |
+          echo "::group::Validate service configuration"
+          
+          SERVICE_NAME="${{ env.TEAM_NAME }}-${{ inputs.service }}-${{ inputs.environment }}"
+          
+          # Get service details
+          SERVICE_INFO=$(gcloud run services describe "$SERVICE_NAME" \
+            --region "${{ env.REGION }}" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --format json)
+          
+          # Validate key configurations
+          echo "Validating service configuration..."
+          
+          ACTUAL_IMAGE=$(echo "$SERVICE_INFO" | jq -r '.spec.template.spec.containers[0].image')
+          ACTUAL_MEMORY=$(echo "$SERVICE_INFO" | jq -r '.spec.template.spec.containers[0].resources.limits.memory')
+          ACTUAL_CPU=$(echo "$SERVICE_INFO" | jq -r '.spec.template.spec.containers[0].resources.limits.cpu')
+          
+          echo "✓ Image: ${ACTUAL_IMAGE}"
+          echo "✓ Memory: ${ACTUAL_MEMORY}"
+          echo "✓ CPU: ${ACTUAL_CPU}"
+          
+          echo "::endgroup::"
+
+      - name: Check Service Health
+        run: |
+          echo "::group::Check service health"
+          
+          SERVICE_URL="${{ needs.deploy.outputs.url }}"
+          MAX_ATTEMPTS=10
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            if [ "${{ inputs.allow_unauthenticated }}" == "true" ]; then
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/health" || echo "000")
+            else
+              ID_TOKEN=$(gcloud auth print-identity-token)
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${ID_TOKEN}" "${SERVICE_URL}/health" || echo "000")
+            fi
+            
+            if [ "$STATUS" == "200" ]; then
+              echo "✓ Service is healthy"
+              break
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Health check attempt ${ATTEMPT}/${MAX_ATTEMPTS} - Status: ${STATUS}"
+            sleep 5
+          done
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "::warning::Service health check did not pass within expected time"
+          fi
+          
+          echo "::endgroup::"

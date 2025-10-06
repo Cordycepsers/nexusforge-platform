@@ -1,0 +1,421 @@
+name: 05 - Security Scan
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Type of security scan'
+        required: true
+        type: choice
+        options:
+          - all
+          - code
+          - containers
+          - secrets
+          - dependencies
+        default: 'all'
+      environments:
+        description: 'Environments to scan (comma-separated: dev,staging,prod or "all")'
+        required: false
+        type: string
+        default: 'all'
+
+env:
+  REGION: us-central1
+  TEAM_NAME: nexusforge
+
+jobs:
+  # ============================================
+  # Code security scan
+  # ============================================
+  scan-code:
+    name: Scan Source Code
+    if: inputs.scan_type == 'all' || inputs.scan_type == 'code' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+
+      - name: Run Security Scan
+        uses: ./.github/actions/security-scan
+        with:
+          scan_type: 'code'
+          path: '.'
+          severity: 'MEDIUM,HIGH,CRITICAL'
+          upload_sarif: 'true'
+
+      - name: Check for Secrets
+        uses: ./.github/actions/security-scan
+        with:
+          scan_type: 'secrets'
+          path: '.'
+          upload_sarif: 'true'
+
+  # ============================================
+  # Container image security scan
+  # ============================================
+  scan-containers:
+    name: Scan Container Images
+    if: inputs.scan_type == 'all' || inputs.scan_type == 'containers' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+    strategy:
+      matrix:
+        service: [python, node, go]
+        environment: [dev, staging, prod]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+          setup_docker: 'true'
+
+      - name: Check Image Exists
+        id: check
+        continue-on-error: true
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/nexusforge-docker/${{ matrix.service }}:latest-${{ matrix.environment }}"
+          
+          if docker pull "$IMAGE" 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Image not found: ${IMAGE}"
+          fi
+
+      - name: Scan Container Image
+        if: steps.check.outputs.exists == 'true'
+        uses: ./.github/actions/security-scan
+        with:
+          scan_type: 'image'
+          image: ${{ steps.check.outputs.image }}
+          severity: 'HIGH,CRITICAL'
+          upload_sarif: 'true'
+
+      - name: Generate Report
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          echo "## Security Scan: ${{ matrix.service }} (${{ matrix.environment }})" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${{ steps.check.outputs.image }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # Dependency vulnerability scan
+  # ============================================
+  scan-dependencies:
+    name: Scan Dependencies
+    if: inputs.scan_type == 'all' || inputs.scan_type == 'dependencies' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      matrix:
+        language: [python, nodejs, go]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        if: matrix.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Setup Node.js
+        if: matrix.language == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+
+      - name: Setup Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.18'
+
+      - name: Scan Python Dependencies
+        if: matrix.language == 'python'
+        run: |
+          cd workspace/python
+          pip install safety
+          safety check --json --output safety-report.json || true
+          
+          if [ -f safety-report.json ]; then
+            echo "## Python Dependency Scan" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat safety-report.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Scan Node.js Dependencies
+        if: matrix.language == 'nodejs'
+        run: |
+          cd workspace/nodejs
+          npm audit --json > npm-audit.json || true
+          
+          if [ -f npm-audit.json ]; then
+            echo "## Node.js Dependency Scan" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat npm-audit.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Scan Go Dependencies
+        if: matrix.language == 'go'
+        run: |
+          cd workspace/go
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./... > govulncheck.txt || true
+          
+          if [ -f govulncheck.txt ]; then
+            echo "## Go Dependency Scan" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat govulncheck.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ============================================
+  # Cloud Run security audit
+  # ============================================
+  audit-deployments:
+    name: Audit Cloud Run Deployments
+    if: github.event_name == 'schedule' || inputs.scan_type == 'all'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Audit Cloud Run Services
+        run: |
+          echo "::group::Audit Cloud Run services in ${{ matrix.environment }}"
+          
+          SERVICES=("python" "node" "go")
+          
+          echo "## Security Audit: ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          for service in "${SERVICES[@]}"; do
+            SERVICE_NAME="${{ env.TEAM_NAME }}-${service}-${{ matrix.environment }}"
+            
+            if gcloud run services describe "$SERVICE_NAME" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}" &>/dev/null; then
+              
+              echo "### ${service}" >> $GITHUB_STEP_SUMMARY
+              
+              # Check authentication
+              AUTH=$(gcloud run services describe "$SERVICE_NAME" \
+                --region "${{ env.REGION }}" \
+                --project "${{ secrets.GCP_PROJECT_ID }}" \
+                --format 'value(metadata.annotations."run.googleapis.com/ingress")')
+              
+              echo "- **Ingress:** ${AUTH:-all}" >> $GITHUB_STEP_SUMMARY
+              
+              # Check VPC connector
+              VPC=$(gcloud run services describe "$SERVICE_NAME" \
+                --region "${{ env.REGION }}" \
+                --project "${{ secrets.GCP_PROJECT_ID }}" \
+                --format 'value(spec.template.metadata.annotations."run.googleapis.com/vpc-access-connector")' || echo "none")
+              
+              echo "- **VPC Connector:** ${VPC}" >> $GITHUB_STEP_SUMMARY
+              
+              # Check service account
+              SA=$(gcloud run services describe "$SERVICE_NAME" \
+                --region "${{ env.REGION }}" \
+                --project "${{ secrets.GCP_PROJECT_ID }}" \
+                --format 'value(spec.template.spec.serviceAccountName)')
+              
+              echo "- **Service Account:** ${SA}" >> $GITHUB_STEP_SUMMARY
+              
+              # Check for environment variables with potential secrets
+              ENV_VARS=$(gcloud run services describe "$SERVICE_NAME" \
+                --region "${{ env.REGION }}" \
+                --project "${{ secrets.GCP_PROJECT_ID }}" \
+                --format 'value(spec.template.spec.containers[0].env)' | grep -i -E '(password|secret|key|token)' || echo "none")
+              
+              if [ "$ENV_VARS" != "none" ]; then
+                echo "- ⚠️ **Potential secrets in env vars detected**" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "- ✅ **No plaintext secrets detected**" >> $GITHUB_STEP_SUMMARY
+              fi
+              
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # IAM and permissions audit
+  # ============================================
+  audit-iam:
+    name: Audit IAM Permissions
+    if: github.event_name == 'schedule' || inputs.scan_type == 'all'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Audit Project IAM
+        run: |
+          echo "::group::Audit IAM bindings"
+          
+          echo "## IAM Audit" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get all IAM bindings
+          gcloud projects get-iam-policy "${{ secrets.GCP_PROJECT_ID }}" \
+            --format json > iam-policy.json
+          
+          # Check for overly permissive roles
+          OWNER_COUNT=$(jq '[.bindings[] | select(.role == "roles/owner") | .members[]] | length' iam-policy.json)
+          EDITOR_COUNT=$(jq '[.bindings[] | select(.role == "roles/editor") | .members[]] | length' iam-policy.json)
+          
+          echo "### Project-Level Roles" >> $GITHUB_STEP_SUMMARY
+          echo "- **Owners:** ${OWNER_COUNT}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Editors:** ${EDITOR_COUNT}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$OWNER_COUNT" -gt 3 ]; then
+            echo "- ⚠️ **Warning:** High number of project owners" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "$EDITOR_COUNT" -gt 5 ]; then
+            echo "- ⚠️ **Warning:** High number of project editors" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check for public access
+          PUBLIC_ACCESS=$(jq '[.bindings[] | select(.members[] | contains("allUsers") or contains("allAuthenticatedUsers"))] | length' iam-policy.json)
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Public Access" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$PUBLIC_ACCESS" -gt 0 ]; then
+            echo "- ⚠️ **Warning:** ${PUBLIC_ACCESS} bindings with public access detected" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ✅ **No public access bindings**" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Network security audit
+  # ============================================
+  audit-network:
+    name: Audit Network Security
+    if: github.event_name == 'schedule' || inputs.scan_type == 'all'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Audit Firewall Rules
+        run: |
+          echo "::group::Audit firewall rules"
+          
+          echo "## Network Security Audit" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # List all firewall rules
+          gcloud compute firewall-rules list \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --format json > firewall-rules.json
+          
+          # Check for overly permissive rules
+          OPEN_RULES=$(jq '[.[] | select(.sourceRanges[] == "0.0.0.0/0")] | length' firewall-rules.json)
+          
+          echo "### Firewall Rules" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Rules:** $(jq 'length' firewall-rules.json)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Open to Internet (0.0.0.0/0):** ${OPEN_RULES}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$OPEN_RULES" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Warning:** Rules open to the internet detected" >> $GITHUB_STEP_SUMMARY
+            jq -r '.[] | select(.sourceRanges[] == "0.0.0.0/0") | "- \(.name): \(.allowed[])"' firewall-rules.json >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "::endgroup::"
+
+  # ============================================
+  # Summary and notifications
+  # ============================================
+  notify:
+    name: Security Scan Summary
+    runs-on: ubuntu-latest
+    needs: [scan-code, scan-containers, scan-dependencies, audit-deployments, audit-iam, audit-network]
+    if: always()
+    
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## 🔒 Security Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Code Scan:** ${{ needs.scan-code.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Container Scan:** ${{ needs.scan-containers.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dependency Scan:** ${{ needs.scan-dependencies.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployment Audit:** ${{ needs.audit-deployments.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **IAM Audit:** ${{ needs.audit-iam.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Network Audit:** ${{ needs.audit-network.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY

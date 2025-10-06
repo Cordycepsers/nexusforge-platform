@@ -1,0 +1,493 @@
+# ============================================
+# NexusForge Platform - All-in-One Docker Compose
+# ============================================
+# Complete local development environment with all services
+# Run: docker-compose -f config/docker/docker-compose-all-in-one.yml up
+#
+# Services included:
+# - Python FastAPI service
+# - Node.js Express service
+# - Go HTTP service
+# - PostgreSQL database
+# - Redis cache
+# - Nginx reverse proxy
+# - Prometheus monitoring
+# - Grafana dashboards
+# ============================================
+
+version: '3.9'
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  nexusforge-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+  monitoring-network:
+    driver: bridge
+
+# ============================================
+# Volumes
+# ============================================
+volumes:
+  postgres-data:
+    driver: local
+  
+  redis-data:
+    driver: local
+  
+  prometheus-data:
+    driver: local
+  
+  grafana-data:
+    driver: local
+  
+  pgadmin-data:
+    driver: local
+
+# ============================================
+# Services
+# ============================================
+services:
+  # ==========================================
+  # PostgreSQL Database
+  # ==========================================
+  postgres:
+    image: postgres:14-alpine
+    container_name: nexusforge-postgres
+    restart: unless-stopped
+    
+    environment:
+      POSTGRES_USER: nexusforge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexusforge_secret_2024}
+      POSTGRES_DB: nexusforge
+      POSTGRES_MULTIPLE_DATABASES: nexusforge_python,nexusforge_node,nexusforge_go
+      PGDATA: /var/lib/postgresql/data/pgdata
+    
+    ports:
+      - "5432:5432"
+    
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init-multiple-databases.sh:/docker-entrypoint-initdb.d/init-multiple-databases.sh:ro
+    
+    networks:
+      nexusforge-network:
+        ipv4_address: 172.28.0.10
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexusforge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    
+    labels:
+      - "com.nexusforge.service=database"
+      - "com.nexusforge.description=PostgreSQL Database"
+
+  # ==========================================
+  # Redis Cache
+  # ==========================================
+  redis:
+    image: redis:6-alpine
+    container_name: nexusforge-redis
+    restart: unless-stopped
+    
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD:-nexusforge_redis_2024}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    
+    ports:
+      - "6379:6379"
+    
+    volumes:
+      - redis-data:/data
+    
+    networks:
+      nexusforge-network:
+        ipv4_address: 172.28.0.11
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    
+    labels:
+      - "com.nexusforge.service=cache"
+      - "com.nexusforge.description=Redis Cache"
+
+  # ==========================================
+  # Python FastAPI Service
+  # ==========================================
+  python-service:
+    build:
+      context: ../../workspace/python
+      dockerfile: ../../config/docker/Dockerfile.python
+      target: development
+      args:
+        PYTHON_VERSION: "3.9"
+    
+    container_name: nexusforge-python
+    restart: unless-stopped
+    
+    environment:
+      # Application
+      APP_NAME: nexusforge-python
+      ENVIRONMENT: development
+      DEBUG: "true"
+      PORT: "8000"
+      
+      # Database
+      DATABASE_URL: postgresql://nexusforge:${POSTGRES_PASSWORD:-nexusforge_secret_2024}@postgres:5432/nexusforge_python
+      
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:-nexusforge_redis_2024}@redis:6379/0
+      
+      # Security
+      SECRET_KEY: ${PYTHON_SECRET_KEY:-python_dev_secret_key_change_in_prod}
+      
+      # Logging
+      LOG_LEVEL: DEBUG
+      
+      # CORS
+      CORS_ORIGINS: http://localhost,http://localhost:80,http://localhost:8000
+    
+    ports:
+      - "8000:8000"
+    
+    volumes:
+      - ../../workspace/python:/app
+      - /app/.venv  # Exclude virtual environment
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+    networks:
+      nexusforge-network:
+        ipv4_address: 172.28.0.20
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    labels:
+      - "com.nexusforge.service=api"
+      - "com.nexusforge.language=python"
+      - "com.nexusforge.description=Python FastAPI Service"
+      - "traefik.enable=true"
+      - "traefik.http.routers.python.rule=PathPrefix(`/api/python`)"
+
+  # ==========================================
+  # Node.js Express Service
+  # ==========================================
+  node-service:
+    build:
+      context: ../../workspace/nodejs
+      dockerfile: ../../config/docker/Dockerfile.node
+      target: development
+      args:
+        NODE_VERSION: "16"
+    
+    container_name: nexusforge-node
+    restart: unless-stopped
+    
+    environment:
+      # Application
+      APP_NAME: nexusforge-node
+      NODE_ENV: development
+      PORT: "3000"
+      
+      # Database
+      DATABASE_URL: postgresql://nexusforge:${POSTGRES_PASSWORD:-nexusforge_secret_2024}@postgres:5432/nexusforge_node
+      
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:-nexusforge_redis_2024}@redis:6379/1
+      
+      # Security
+      JWT_SECRET: ${NODE_JWT_SECRET:-node_dev_jwt_secret_change_in_prod}
+      
+      # Logging
+      LOG_LEVEL: debug
+      
+      # CORS
+      CORS_ORIGINS: http://localhost,http://localhost:80,http://localhost:3000
+    
+    ports:
+      - "3000:3000"
+    
+    volumes:
+      - ../../workspace/nodejs:/app
+      - /app/node_modules  # Exclude node_modules
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+    networks:
+      nexusforge-network:
+        ipv4_address: 172.28.0.21
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    labels:
+      - "com.nexusforge.service=api"
+      - "com.nexusforge.language=nodejs"
+      - "com.nexusforge.description=Node.js Express Service"
+      - "traefik.enable=true"
+      - "traefik.http.routers.node.rule=PathPrefix(`/api/node`)"
+
+  # ==========================================
+  # Go HTTP Service
+  # ==========================================
+  go-service:
+    build:
+      context: ../../workspace/go
+      dockerfile: ../../config/docker/Dockerfile.go
+      target: development
+      args:
+        GO_VERSION: "1.18"
+    
+    container_name: nexusforge-go
+    restart: unless-stopped
+    
+    environment:
+      # Application
+      APP_NAME: nexusforge-go
+      GO_ENV: development
+      PORT: "8080"
+      
+      # Database
+      DATABASE_URL: postgresql://nexusforge:${POSTGRES_PASSWORD:-nexusforge_secret_2024}@postgres:5432/nexusforge_go
+      
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:-nexusforge_redis_2024}@redis:6379/2
+      
+      # Security
+      JWT_SECRET: ${GO_JWT_SECRET:-go_dev_jwt_secret_change_in_prod}
+      
+      # Logging
+      LOG_LEVEL: debug
+      
+      # CORS
+      CORS_ORIGINS: http://localhost,http://localhost:80,http://localhost:8080
+    
+    ports:
+      - "8080:8080"
+    
+    volumes:
+      - ../../workspace/go:/app
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+    networks:
+      nexusforge-network:
+        ipv4_address: 172.28.0.22
+    
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    labels:
+      - "com.nexusforge.service=api"
+      - "com.nexusforge.language=go"
+      - "com.nexusforge.description=Go HTTP Service"
+      - "traefik.enable=true"
+      - "traefik.http.routers.go.rule=PathPrefix(`/api/go`)"
+
+  # ==========================================
+  # Nginx Reverse Proxy
+  # ==========================================
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nexusforge-nginx
+    restart: unless-stopped
+    
+    ports:
+      - "80:80"
+      - "443:443"
+    
+    volumes:
+      - ../nginx/nginx-all-in-one.conf:/etc/nginx/nginx.conf:ro
+      - ../nginx/ssl:/etc/nginx/ssl:ro
+    
+    depends_on:
+      - python-service
+      - node-service
+      - go-service
+    
+    networks:
+      nexusforge-network:
+        ipv4_address: 172.28.0.5
+    
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+    labels:
+      - "com.nexusforge.service=proxy"
+      - "com.nexusforge.description=Nginx Reverse Proxy"
+
+  # ==========================================
+  # Prometheus Monitoring
+  # ==========================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: nexusforge-prometheus
+    restart: unless-stopped
+    
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=30d'
+    
+    ports:
+      - "9090:9090"
+    
+    volumes:
+      - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    
+    networks:
+      - nexusforge-network
+      - monitoring-network
+    
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+    labels:
+      - "com.nexusforge.service=monitoring"
+      - "com.nexusforge.description=Prometheus Metrics"
+
+  # ==========================================
+  # Grafana Dashboards
+  # ==========================================
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: nexusforge-grafana
+    restart: unless-stopped
+    
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+      GF_SERVER_ROOT_URL: http://localhost:3001
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    
+    ports:
+      - "3001:3000"
+    
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ../monitoring/dashboards:/etc/grafana/provisioning/dashboards:ro
+    
+    depends_on:
+      - prometheus
+    
+    networks:
+      - monitoring-network
+    
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+    labels:
+      - "com.nexusforge.service=monitoring"
+      - "com.nexusforge.description=Grafana Dashboards"
+
+  # ==========================================
+  # PgAdmin (Optional Database Management)
+  # ==========================================
+  pgadmin:
+    image: dpage/pgadmin4:8.0
+    container_name: nexusforge-pgadmin
+    restart: unless-stopped
+    profiles:
+      - tools
+    
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@nexusforge.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    
+    ports:
+      - "5050:80"
+    
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    
+    depends_on:
+      - postgres
+    
+    networks:
+      - nexusforge-network
+    
+    labels:
+      - "com.nexusforge.service=tools"
+      - "com.nexusforge.description=PostgreSQL Admin"
+
+  # ==========================================
+  # Redis Commander (Optional Redis Management)
+  # ==========================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: nexusforge-redis-commander
+    restart: unless-stopped
+    profiles:
+      - tools
+    
+    environment:
+      REDIS_HOSTS: local:redis:6379:0:${REDIS_PASSWORD:-nexusforge_redis_2024}
+      HTTP_USER: ${REDIS_COMMANDER_USER:-admin}
+      HTTP_PASSWORD: ${REDIS_COMMANDER_PASSWORD:-admin}
+    
+    ports:
+      - "8081:8081"
+    
+    depends_on:
+      - redis
+    
+    networks:
+      - nexusforge-network
+    
+    labels:
+      - "com.nexusforge.service=tools"
+      - "com.nexusforge.description=Redis Commander"

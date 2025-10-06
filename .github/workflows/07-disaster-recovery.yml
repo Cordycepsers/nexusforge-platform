@@ -1,0 +1,513 @@
+name: 07 - Disaster Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      recovery_type:
+        description: 'Type of recovery to perform'
+        required: true
+        type: choice
+        options:
+          - full
+          - database
+          - configuration
+          - services
+        default: 'full'
+      environment:
+        description: 'Environment to recover'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      backup_id:
+        description: 'Backup ID to restore (leave empty for latest)'
+        required: false
+        type: string
+      confirmation:
+        description: 'Type "CONFIRM" to proceed with recovery'
+        required: true
+        type: string
+
+env:
+  REGION: us-central1
+  TEAM_NAME: nexusforge
+  BACKUP_BUCKET: nexusforge-backups
+
+jobs:
+  # ============================================
+  # Validate recovery request
+  # ============================================
+  validate:
+    name: Validate Recovery Request
+    runs-on: ubuntu-latest
+    outputs:
+      backup_id: ${{ steps.backup.outputs.id }}
+      environment: ${{ steps.env.outputs.name }}
+    
+    steps:
+      - name: Validate Confirmation
+        run: |
+          if [ "${{ inputs.confirmation }}" != "CONFIRM" ]; then
+            echo "::error::Recovery confirmation failed. Please type CONFIRM to proceed."
+            exit 1
+          fi
+          
+          echo "## ⚠️ DISASTER RECOVERY INITIATED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**CRITICAL OPERATION IN PROGRESS**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Recovery Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type:** ${{ inputs.recovery_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Initiated by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+      - name: Validate Environment
+        id: env
+        run: |
+          ENV="${{ inputs.environment }}"
+          
+          if [ -z "$ENV" ]; then
+            echo "::error::Environment not specified"
+            exit 1
+          fi
+          
+          if [ "$ENV" == "prod" ]; then
+            echo "::warning::PRODUCTION RECOVERY - Proceed with extreme caution"
+          fi
+          
+          echo "name=${ENV}" >> $GITHUB_OUTPUT
+
+      - name: Determine Backup ID
+        id: backup
+        run: |
+          BACKUP_ID="${{ inputs.backup_id }}"
+          
+          if [ -z "$BACKUP_ID" ]; then
+            echo "No backup ID specified, will use latest backup"
+            echo "id=latest" >> $GITHUB_OUTPUT
+          else
+            echo "Using specified backup: ${BACKUP_ID}"
+            echo "id=${BACKUP_ID}" >> $GITHUB_OUTPUT
+          fi
+
+  # ============================================
+  # Production approval gate
+  # ============================================
+  approval:
+    name: Production Recovery Approval
+    if: inputs.environment == 'prod'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment:
+      name: production-recovery
+    
+    steps:
+      - name: Approval Gate
+        run: |
+          echo "## 🔐 Production Recovery Approval" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**CRITICAL:** Recovering production environment" >> $GITHUB_STEP_SUMMARY
+          echo "Approved by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # Pre-recovery snapshot
+  # ============================================
+  snapshot:
+    name: Create Pre-Recovery Snapshot
+    needs: [validate, approval]
+    if: always() && needs.validate.result == 'success' && (inputs.environment != 'prod' || needs.approval.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      snapshot_id: ${{ steps.snapshot.outputs.id }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Create Current State Snapshot
+        id: snapshot
+        run: |
+          SNAPSHOT_ID="pre-recovery-$(date +%Y%m%d-%H%M%S)"
+          ENV="${{ needs.validate.outputs.environment }}"
+          
+          echo "Creating snapshot of current state..."
+          
+          mkdir -p snapshot
+          
+          # Snapshot Cloud Run services
+          SERVICES=("python" "node" "go")
+          for service in "${SERVICES[@]}"; do
+            SERVICE_NAME="${{ env.TEAM_NAME }}-${service}-${ENV}"
+            
+            if gcloud run services describe "$SERVICE_NAME" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}" \
+              --format yaml > "snapshot/${SERVICE_NAME}.yaml" 2>/dev/null; then
+              echo "✓ Snapshotted ${SERVICE_NAME}"
+            fi
+          done
+          
+          # Upload snapshot
+          gsutil -m cp -r snapshot/* \
+            "gs://${{ env.BACKUP_BUCKET }}/recovery-snapshots/${ENV}/${SNAPSHOT_ID}/"
+          
+          echo "id=${SNAPSHOT_ID}" >> $GITHUB_OUTPUT
+          echo "✓ Pre-recovery snapshot created: ${SNAPSHOT_ID}"
+
+  # ============================================
+  # Restore database
+  # ============================================
+  restore-database:
+    name: Restore Database
+    if: inputs.recovery_type == 'full' || inputs.recovery_type == 'database'
+    needs: [validate, snapshot]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Find Latest Backup
+        id: find
+        run: |
+          ENV="${{ needs.validate.outputs.environment }}"
+          BACKUP_ID="${{ needs.validate.outputs.backup_id }}"
+          
+          if [ "$BACKUP_ID" == "latest" ]; then
+            # Find most recent backup
+            LATEST=$(gsutil ls "gs://${{ env.BACKUP_BUCKET }}/databases/${ENV}/" | sort -r | head -n 1)
+            
+            if [ -z "$LATEST" ]; then
+              echo "::error::No backups found for ${ENV}"
+              exit 1
+            fi
+            
+            echo "backup_uri=${LATEST}" >> $GITHUB_OUTPUT
+            echo "Using latest backup: ${LATEST}"
+          else
+            BACKUP_URI="gs://${{ env.BACKUP_BUCKET }}/databases/${ENV}/${BACKUP_ID}.sql"
+            echo "backup_uri=${BACKUP_URI}" >> $GITHUB_OUTPUT
+            echo "Using specified backup: ${BACKUP_URI}"
+          fi
+
+      - name: Restore Cloud SQL Database
+        run: |
+          ENV="${{ needs.validate.outputs.environment }}"
+          INSTANCE_NAME="nexusforge-db-${ENV}"
+          BACKUP_URI="${{ steps.find.outputs.backup_uri }}"
+          
+          echo "Restoring database from ${BACKUP_URI}..."
+          
+          # Import database
+          gcloud sql import sql "$INSTANCE_NAME" "$BACKUP_URI" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --database=nexusforge
+          
+          echo "✓ Database restored successfully"
+          
+          echo "## Database Recovery" >> $GITHUB_STEP_SUMMARY
+          echo "- **Instance:** ${INSTANCE_NAME}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backup:** ${BACKUP_URI}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ✅ Complete" >> $GITHUB_STEP_SUMMARY
+
+      - name: Restore Redis Data
+        continue-on-error: true
+        run: |
+          ENV="${{ needs.validate.outputs.environment }}"
+          REDIS_INSTANCE="nexusforge-redis-${ENV}"
+          BACKUP_ID="${{ needs.validate.outputs.backup_id }}"
+          
+          if [ "$BACKUP_ID" == "latest" ]; then
+            BACKUP_URI=$(gsutil ls "gs://${{ env.BACKUP_BUCKET }}/redis/${ENV}/" | sort -r | head -n 1)
+          else
+            BACKUP_URI="gs://${{ env.BACKUP_BUCKET }}/redis/${ENV}/${BACKUP_ID}.rdb"
+          fi
+          
+          if [ -n "$BACKUP_URI" ]; then
+            echo "Restoring Redis from ${BACKUP_URI}..."
+            
+            gcloud redis instances import "$REDIS_INSTANCE" \
+              "$BACKUP_URI" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}"
+            
+            echo "✓ Redis restored successfully"
+          fi
+
+  # ============================================
+  # Restore configuration
+  # ============================================
+  restore-configuration:
+    name: Restore Configuration
+    if: inputs.recovery_type == 'full' || inputs.recovery_type == 'configuration'
+    needs: [validate, snapshot]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Download Configuration Backup
+        run: |
+          ENV="${{ needs.validate.outputs.environment }}"
+          BACKUP_ID="${{ needs.validate.outputs.backup_id }}"
+          
+          mkdir -p config-restore
+          
+          if [ "$BACKUP_ID" == "latest" ]; then
+            # Find latest backup
+            LATEST_DIR=$(gsutil ls "gs://${{ env.BACKUP_BUCKET }}/config/${ENV}/" | sort -r | head -n 1)
+            
+            if [ -z "$LATEST_DIR" ]; then
+              echo "::error::No configuration backups found"
+              exit 1
+            fi
+            
+            gsutil -m cp -r "${LATEST_DIR}*" config-restore/
+          else
+            gsutil -m cp -r "gs://${{ env.BACKUP_BUCKET }}/config/${ENV}/${BACKUP_ID}/*" config-restore/
+          fi
+          
+          echo "✓ Configuration backup downloaded"
+
+      - name: Restore VPC Configuration
+        continue-on-error: true
+        run: |
+          if [ -f config-restore/vpc-connectors.yaml ]; then
+            echo "VPC connector configuration found (manual review required)"
+            cat config-restore/vpc-connectors.yaml
+          fi
+
+      - name: Restore Firewall Rules
+        continue-on-error: true
+        run: |
+          if [ -f config-restore/firewall-rules.yaml ]; then
+            echo "Firewall rules found (manual review required)"
+            cat config-restore/firewall-rules.yaml
+            
+            echo "::warning::Firewall rules require manual restoration for safety"
+          fi
+
+  # ============================================
+  # Restore services
+  # ============================================
+  restore-services:
+    name: Restore Cloud Run Services
+    if: inputs.recovery_type == 'full' || inputs.recovery_type == 'services'
+    needs: [validate, snapshot, restore-database, restore-configuration]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        service: [python, node, go]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+          setup_docker: 'true'
+
+      - name: Get Service Configuration
+        run: |
+          ENV="${{ needs.validate.outputs.environment }}"
+          BACKUP_ID="${{ needs.validate.outputs.backup_id }}"
+          SERVICE_NAME="${{ env.TEAM_NAME }}-${{ matrix.service }}-${ENV}"
+          
+          mkdir -p service-config
+          
+          if [ "$BACKUP_ID" == "latest" ]; then
+            LATEST_DIR=$(gsutil ls "gs://${{ env.BACKUP_BUCKET }}/config/${ENV}/" | sort -r | head -n 1)
+            gsutil cp "${LATEST_DIR}${SERVICE_NAME}.yaml" service-config/ || true
+          else
+            gsutil cp "gs://${{ env.BACKUP_BUCKET }}/config/${ENV}/${BACKUP_ID}/${SERVICE_NAME}.yaml" service-config/ || true
+          fi
+
+      - name: Restore Service
+        run: |
+          ENV="${{ needs.validate.outputs.environment }}"
+          SERVICE_NAME="${{ env.TEAM_NAME }}-${{ matrix.service }}-${ENV}"
+          
+          if [ -f "service-config/${SERVICE_NAME}.yaml" ]; then
+            echo "Restoring ${SERVICE_NAME}..."
+            
+            # Apply service configuration
+            gcloud run services replace "service-config/${SERVICE_NAME}.yaml" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}"
+            
+            echo "✓ Service ${SERVICE_NAME} restored"
+          else
+            echo "::warning::Configuration not found for ${SERVICE_NAME}"
+          fi
+
+      - name: Verify Service Health
+        run: |
+          ENV="${{ needs.validate.outputs.environment }}"
+          SERVICE_NAME="${{ env.TEAM_NAME }}-${{ matrix.service }}-${ENV}"
+          
+          # Wait for service to be ready
+          sleep 30
+          
+          # Get service URL
+          URL=$(gcloud run services describe "$SERVICE_NAME" \
+            --region "${{ env.REGION }}" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --format 'value(status.url)')
+          
+          # Get auth token
+          ID_TOKEN=$(gcloud auth print-identity-token)
+          
+          # Health check
+          HEALTH=$(curl -s -w "%{http_code}" -o /dev/null \
+            -H "Authorization: Bearer ${ID_TOKEN}" \
+            "${URL}/health" || echo "000")
+          
+          if [ "$HEALTH" == "200" ]; then
+            echo "✅ ${SERVICE_NAME} is healthy"
+          else
+            echo "::warning::${SERVICE_NAME} health check failed: ${HEALTH}"
+          fi
+
+  # ============================================
+  # Post-recovery validation
+  # ============================================
+  validate-recovery:
+    name: Validate Recovery
+    needs: [validate, restore-database, restore-configuration, restore-services]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Run Integration Tests
+        continue-on-error: true
+        run: |
+          ENV="${{ needs.validate.outputs.environment }}"
+          
+          echo "Running post-recovery validation..."
+          
+          ID_TOKEN=$(gcloud auth print-identity-token)
+          ALL_HEALTHY=true
+          
+          SERVICES=("python" "node" "go")
+          for service in "${SERVICES[@]}"; do
+            SERVICE_NAME="${{ env.TEAM_NAME }}-${service}-${ENV}"
+            
+            URL=$(gcloud run services describe "$SERVICE_NAME" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}" \
+              --format 'value(status.url)')
+            
+            HEALTH=$(curl -s -w "%{http_code}" -o /dev/null \
+              -H "Authorization: Bearer ${ID_TOKEN}" \
+              "${URL}/health" || echo "000")
+            
+            if [ "$HEALTH" == "200" ]; then
+              echo "✓ ${service} is operational"
+            else
+              echo "✗ ${service} is not responding correctly"
+              ALL_HEALTHY=false
+            fi
+          done
+          
+          if [ "$ALL_HEALTHY" == "true" ]; then
+            echo "recovery_status=success" >> $GITHUB_OUTPUT
+            echo "## ✅ Recovery Validation Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "recovery_status=partial" >> $GITHUB_OUTPUT
+            echo "## ⚠️ Recovery Validation: Issues Detected" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ============================================
+  # Generate recovery report
+  # ============================================
+  report:
+    name: Generate Recovery Report
+    needs: [validate, snapshot, restore-database, restore-configuration, restore-services, validate-recovery]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Generate Comprehensive Report
+        run: |
+          echo "## 🔄 DISASTER RECOVERY REPORT" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Recovery Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type:** ${{ inputs.recovery_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ needs.validate.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backup ID:** ${{ needs.validate.outputs.backup_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Pre-Recovery Snapshot:** ${{ needs.snapshot.outputs.snapshot_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Component Status" >> $GITHUB_STEP_SUMMARY
+          echo "- **Database:** ${{ needs.restore-database.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Configuration:** ${{ needs.restore-configuration.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Services:** ${{ needs.restore-services.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Validation:** ${{ needs.validate-recovery.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Timeline" >> $GITHUB_STEP_SUMMARY
+          echo "- **Initiated:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Initiated by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Verify all services are functioning correctly" >> $GITHUB_STEP_SUMMARY
+          echo "2. Run comprehensive integration tests" >> $GITHUB_STEP_SUMMARY
+          echo "3. Monitor application logs for any issues" >> $GITHUB_STEP_SUMMARY
+          echo "4. Update incident documentation" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,326 @@
+{
+  "folders": [
+    {
+      "name": "NexusForge Platform",
+      "path": "."
+    },
+    {
+      "name": "Python Service",
+      "path": "workspace/python"
+    },
+    {
+      "name": "Node.js Service",
+      "path": "workspace/nodejs"
+    },
+    {
+      "name": "Go Service",
+      "path": "workspace/go"
+    },
+    {
+      "name": "Infrastructure",
+      "path": "infrastructure"
+    },
+    {
+      "name": "Configuration",
+      "path": "config"
+    },
+    {
+      "name": "Documentation",
+      "path": "docs"
+    }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/*.pyc": true,
+      "**/node_modules": true,
+      "**/.pytest_cache": true,
+      "**/coverage": true,
+      "**/.mypy_cache": true,
+      "**/dist": true,
+      "**/.next": true,
+      "**/bin": true,
+      "**/.DS_Store": true
+    },
+    "search.exclude": {
+      "**/node_modules": true,
+      "**/bower_components": true,
+      "**/*.code-search": true,
+      "**/venv": true,
+      "**/__pycache__": true,
+      "**/coverage": true,
+      "**/dist": true
+    },
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    },
+    "[python]": {
+      "editor.defaultFormatter": "ms-python.black-formatter",
+      "editor.formatOnSave": true,
+      "editor.codeActionsOnSave": {
+        "source.organizeImports": "explicit"
+      },
+      "editor.rulers": [100]
+    },
+    "[typescript]": {
+      "editor.defaultFormatter": "esbenp.prettier-vscode",
+      "editor.formatOnSave": true,
+      "editor.rulers": [100]
+    },
+    "[javascript]": {
+      "editor.defaultFormatter": "esbenp.prettier-vscode",
+      "editor.formatOnSave": true
+    },
+    "[go]": {
+      "editor.formatOnSave": true,
+      "editor.codeActionsOnSave": {
+        "source.organizeImports": "explicit"
+      }
+    },
+    "[json]": {
+      "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+    "[yaml]": {
+      "editor.defaultFormatter": "redhat.vscode-yaml"
+    },
+    "[dockerfile]": {
+      "editor.defaultFormatter": "ms-azuretools.vscode-docker"
+    },
+    "python.defaultInterpreterPath": "${workspaceFolder}/workspace/python/venv/bin/python",
+    "python.terminal.activateEnvironment": true,
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true,
+    "python.linting.flake8Enabled": false,
+    "python.formatting.provider": "black",
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestArgs": [
+      "workspace/python/tests"
+    ],
+    "typescript.updateImportsOnFileMove.enabled": "always",
+    "javascript.updateImportsOnFileMove.enabled": "always",
+    "go.useLanguageServer": true,
+    "go.formatTool": "goimports",
+    "go.lintTool": "golangci-lint",
+    "go.lintOnSave": "package",
+    "go.testFlags": ["-v"],
+    "go.coverOnSave": false,
+    "docker.languageserver.formatter.ignoreMultilineInstructions": true,
+    "docker.dockerComposeBuild": true,
+    "files.associations": {
+      "*.yml": "yaml",
+      "*.yaml": "yaml",
+      "Dockerfile*": "dockerfile",
+      ".env*": "dotenv",
+      "*.sh": "shellscript"
+    },
+    "terminal.integrated.env.osx": {
+      "PYTHONPATH": "${workspaceFolder}/workspace/python"
+    },
+    "terminal.integrated.env.linux": {
+      "PYTHONPATH": "${workspaceFolder}/workspace/python"
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.vscode-pylance",
+      "ms-python.black-formatter",
+      "dbaeumer.vscode-eslint",
+      "esbenp.prettier-vscode",
+      "golang.go",
+      "ms-azuretools.vscode-docker",
+      "redhat.vscode-yaml",
+      "ms-vscode.makefile-tools",
+      "mtxr.sqltools",
+      "mtxr.sqltools-driver-pg",
+      "ckolkman.vscode-postgres",
+      "ms-kubernetes-tools.vscode-kubernetes-tools",
+      "googlecloudtools.cloudcode",
+      "github.vscode-github-actions",
+      "eamodio.gitlens",
+      "wayou.vscode-todo-highlight",
+      "gruntfuggly.todo-tree",
+      "streetsidesoftware.code-spell-checker",
+      "tamasfe.even-better-toml",
+      "timonwong.shellcheck"
+    ]
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Python: FastAPI",
+        "type": "python",
+        "request": "launch",
+        "module": "uvicorn",
+        "args": [
+          "app.main:app",
+          "--reload",
+          "--host",
+          "0.0.0.0",
+          "--port",
+          "8000"
+        ],
+        "jinja": true,
+        "cwd": "${workspaceFolder}/workspace/python",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}/workspace/python"
+        }
+      },
+      {
+        "name": "Python: Pytest",
+        "type": "python",
+        "request": "launch",
+        "module": "pytest",
+        "args": [
+          "-v",
+          "tests/"
+        ],
+        "cwd": "${workspaceFolder}/workspace/python",
+        "console": "integratedTerminal"
+      },
+      {
+        "name": "Node.js: Debug",
+        "type": "node",
+        "request": "launch",
+        "runtimeExecutable": "npm",
+        "runtimeArgs": [
+          "run",
+          "dev"
+        ],
+        "cwd": "${workspaceFolder}/workspace/nodejs",
+        "skipFiles": [
+          "<node_internals>/**"
+        ],
+        "console": "integratedTerminal"
+      },
+      {
+        "name": "Node.js: Jest Tests",
+        "type": "node",
+        "request": "launch",
+        "runtimeExecutable": "npm",
+        "runtimeArgs": [
+          "test",
+          "--",
+          "--runInBand"
+        ],
+        "cwd": "${workspaceFolder}/workspace/nodejs",
+        "console": "integratedTerminal"
+      },
+      {
+        "name": "Go: Launch",
+        "type": "go",
+        "request": "launch",
+        "mode": "auto",
+        "program": "${workspaceFolder}/workspace/go/cmd/api",
+        "cwd": "${workspaceFolder}/workspace/go",
+        "env": {},
+        "args": []
+      },
+      {
+        "name": "Go: Test Current File",
+        "type": "go",
+        "request": "launch",
+        "mode": "test",
+        "program": "${file}",
+        "cwd": "${workspaceFolder}/workspace/go"
+      },
+      {
+        "name": "Go: Test Package",
+        "type": "go",
+        "request": "launch",
+        "mode": "test",
+        "program": "${fileDirname}",
+        "cwd": "${workspaceFolder}/workspace/go"
+      },
+      {
+        "name": "Docker: Attach to Python",
+        "type": "python",
+        "request": "attach",
+        "connect": {
+          "host": "localhost",
+          "port": 5678
+        },
+        "pathMappings": [
+          {
+            "localRoot": "${workspaceFolder}/workspace/python",
+            "remoteRoot": "/app"
+          }
+        ]
+      }
+    ],
+    "compounds": [
+      {
+        "name": "All Services",
+        "configurations": [
+          "Python: FastAPI",
+          "Node.js: Debug",
+          "Go: Launch"
+        ]
+      }
+    ]
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Start All Services",
+        "type": "shell",
+        "command": "make dev",
+        "problemMatcher": [],
+        "group": {
+          "kind": "build",
+          "isDefault": true
+        }
+      },
+      {
+        "label": "Stop All Services",
+        "type": "shell",
+        "command": "make stop",
+        "problemMatcher": []
+      },
+      {
+        "label": "Run All Tests",
+        "type": "shell",
+        "command": "make test",
+        "problemMatcher": [],
+        "group": {
+          "kind": "test",
+          "isDefault": true
+        }
+      },
+      {
+        "label": "Build All Docker Images",
+        "type": "shell",
+        "command": "make build",
+        "problemMatcher": []
+      },
+      {
+        "label": "Format All Code",
+        "type": "shell",
+        "command": "make format",
+        "problemMatcher": []
+      },
+      {
+        "label": "Lint All Code",
+        "type": "shell",
+        "command": "make lint",
+        "problemMatcher": []
+      },
+      {
+        "label": "Health Check",
+        "type": "shell",
+        "command": "./scripts/utilities/health-check.sh",
+        "problemMatcher": []
+      },
+      {
+        "label": "Monitor Services",
+        "type": "shell",
+        "command": "./scripts/utilities/monitor-all-in-one.sh",
+        "problemMatcher": []
+      }
+    ]
+  }
+}

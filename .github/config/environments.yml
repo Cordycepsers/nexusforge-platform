@@ -1,0 +1,553 @@
+# ============================================
+# NexusForge Platform - Environment Configuration
+# ============================================
+# Centralized environment-specific settings for all workflows
+# Used by GitHub Actions to configure deployments across environments
+
+# ============================================
+# Global Settings
+# ============================================
+global:
+  project_name: nexusforge-platform
+  team_name: nexusforge
+  region: us-central1
+  backup_region: us-east1
+  artifact_registry: nexusforge-docker
+  backup_bucket: nexusforge-backups
+  monitoring_workspace: nexusforge-monitoring
+  
+  # Default resource settings
+  default_timeout: 300
+  default_memory: 512Mi
+  default_cpu: 1
+  
+  # Security settings
+  security:
+    enable_vpc: true
+    enable_iap: true
+    enable_cloud_armor: true
+    require_ssl: true
+    min_tls_version: "1.2"
+  
+  # Monitoring settings
+  monitoring:
+    enable_cloud_trace: true
+    enable_cloud_profiler: true
+    enable_error_reporting: true
+    log_level: INFO
+    metrics_interval: 60
+
+# ============================================
+# Development Environment
+# ============================================
+dev:
+  # Environment metadata
+  metadata:
+    environment: development
+    color: "#3498db"  # Blue
+    icon: "🔧"
+    description: "Development environment for active development and testing"
+    requires_approval: false
+    auto_deploy: true
+  
+  # GCP settings
+  gcp:
+    project_id_placeholder: "your-gcp-project-dev"
+    region: us-central1
+    zone: us-central1-a
+    network: nexusforge-vpc-dev
+    subnet: nexusforge-subnet-dev
+    
+  # Cloud Run settings
+  cloud_run:
+    min_instances: 0
+    max_instances: 10
+    concurrency: 80
+    timeout: 300
+    allow_unauthenticated: false
+    cpu_throttling: true
+    execution_environment: gen2
+    
+    # Service-specific overrides
+    services:
+      python:
+        port: 8000
+        memory: 1Gi
+        cpu: 1
+        min_instances: 0
+        max_instances: 5
+      
+      node:
+        port: 3000
+        memory: 1Gi
+        cpu: 1
+        min_instances: 0
+        max_instances: 5
+      
+      go:
+        port: 8080
+        memory: 512Mi
+        cpu: 1
+        min_instances: 0
+        max_instances: 5
+  
+  # Database settings
+  database:
+    instance_name: nexusforge-db-dev
+    tier: db-f1-micro
+    disk_size: 10
+    disk_type: PD_SSD
+    backup_enabled: true
+    backup_start_time: "03:00"
+    high_availability: false
+    database_version: POSTGRES_14
+    
+    # Connection settings
+    max_connections: 100
+    connection_timeout: 10
+  
+  # Redis settings
+  redis:
+    instance_name: nexusforge-redis-dev
+    tier: BASIC
+    memory_size: 1
+    redis_version: REDIS_6_X
+    auth_enabled: true
+  
+  # Security settings
+  security:
+    enable_vpc_connector: true
+    vpc_connector: nexusforge-vpc-connector-dev
+    ingress: internal-and-cloud-load-balancing
+    egress: private-ranges-only
+    
+    # IAM settings
+    service_account: nexusforge-dev@PROJECT_ID.iam.gserviceaccount.com
+    
+    # Secret Manager
+    secrets_prefix: dev
+    
+  # Monitoring settings
+  monitoring:
+    log_level: DEBUG
+    enable_profiling: true
+    sample_rate: 1.0
+    alert_enabled: false
+    
+  # Feature flags
+  features:
+    debug_mode: true
+    verbose_logging: true
+    enable_cors: true
+    rate_limiting: false
+    caching: true
+    
+  # Environment variables
+  env_vars:
+    ENVIRONMENT: development
+    LOG_LEVEL: DEBUG
+    ENABLE_SWAGGER: "true"
+    CORS_ORIGINS: "*"
+    RATE_LIMIT_ENABLED: "false"
+
+# ============================================
+# Staging Environment
+# ============================================
+staging:
+  # Environment metadata
+  metadata:
+    environment: staging
+    color: "#f39c12"  # Orange
+    icon: "🎯"
+    description: "Pre-production environment for integration testing"
+    requires_approval: true
+    auto_deploy: false
+  
+  # GCP settings
+  gcp:
+    project_id_placeholder: "your-gcp-project-staging"
+    region: us-central1
+    zone: us-central1-b
+    network: nexusforge-vpc-staging
+    subnet: nexusforge-subnet-staging
+    
+  # Cloud Run settings
+  cloud_run:
+    min_instances: 1
+    max_instances: 20
+    concurrency: 100
+    timeout: 300
+    allow_unauthenticated: false
+    cpu_throttling: true
+    execution_environment: gen2
+    
+    # Service-specific overrides
+    services:
+      python:
+        port: 8000
+        memory: 2Gi
+        cpu: 2
+        min_instances: 1
+        max_instances: 10
+      
+      node:
+        port: 3000
+        memory: 2Gi
+        cpu: 2
+        min_instances: 1
+        max_instances: 10
+      
+      go:
+        port: 8080
+        memory: 1Gi
+        cpu: 2
+        min_instances: 1
+        max_instances: 10
+  
+  # Database settings
+  database:
+    instance_name: nexusforge-db-staging
+    tier: db-g1-small
+    disk_size: 50
+    disk_type: PD_SSD
+    backup_enabled: true
+    backup_start_time: "02:00"
+    high_availability: false
+    database_version: POSTGRES_14
+    
+    # Connection settings
+    max_connections: 200
+    connection_timeout: 10
+    
+    # Point-in-time recovery
+    point_in_time_recovery: true
+  
+  # Redis settings
+  redis:
+    instance_name: nexusforge-redis-staging
+    tier: STANDARD_HA
+    memory_size: 2
+    redis_version: REDIS_6_X
+    auth_enabled: true
+  
+  # Security settings
+  security:
+    enable_vpc_connector: true
+    vpc_connector: nexusforge-vpc-connector-staging
+    ingress: internal-and-cloud-load-balancing
+    egress: private-ranges-only
+    
+    # IAM settings
+    service_account: nexusforge-staging@PROJECT_ID.iam.gserviceaccount.com
+    
+    # Secret Manager
+    secrets_prefix: staging
+    
+  # Monitoring settings
+  monitoring:
+    log_level: INFO
+    enable_profiling: true
+    sample_rate: 0.5
+    alert_enabled: true
+    alert_email: staging-alerts@example.com
+    
+  # Feature flags
+  features:
+    debug_mode: false
+    verbose_logging: true
+    enable_cors: true
+    rate_limiting: true
+    caching: true
+    
+  # Environment variables
+  env_vars:
+    ENVIRONMENT: staging
+    LOG_LEVEL: INFO
+    ENABLE_SWAGGER: "true"
+    CORS_ORIGINS: "https://staging.example.com"
+    RATE_LIMIT_ENABLED: "true"
+    RATE_LIMIT_REQUESTS: "100"
+    RATE_LIMIT_WINDOW: "60"
+
+# ============================================
+# Production Environment
+# ============================================
+prod:
+  # Environment metadata
+  metadata:
+    environment: production
+    color: "#e74c3c"  # Red
+    icon: "🚀"
+    description: "Production environment serving live traffic"
+    requires_approval: true
+    auto_deploy: false
+  
+  # GCP settings
+  gcp:
+    project_id_placeholder: "your-gcp-project-prod"
+    region: us-central1
+    zone: us-central1-c
+    network: nexusforge-vpc-prod
+    subnet: nexusforge-subnet-prod
+    
+  # Cloud Run settings
+  cloud_run:
+    min_instances: 2
+    max_instances: 50
+    concurrency: 100
+    timeout: 300
+    allow_unauthenticated: false
+    cpu_throttling: false
+    execution_environment: gen2
+    
+    # Service-specific overrides
+    services:
+      python:
+        port: 8000
+        memory: 4Gi
+        cpu: 4
+        min_instances: 2
+        max_instances: 20
+        startup_cpu_boost: true
+      
+      node:
+        port: 3000
+        memory: 4Gi
+        cpu: 4
+        min_instances: 2
+        max_instances: 20
+        startup_cpu_boost: true
+      
+      go:
+        port: 8080
+        memory: 2Gi
+        cpu: 2
+        min_instances: 2
+        max_instances: 20
+        startup_cpu_boost: true
+  
+  # Database settings
+  database:
+    instance_name: nexusforge-db-prod
+    tier: db-n1-standard-2
+    disk_size: 100
+    disk_type: PD_SSD
+    backup_enabled: true
+    backup_start_time: "01:00"
+    high_availability: true
+    database_version: POSTGRES_14
+    
+    # Connection settings
+    max_connections: 500
+    connection_timeout: 10
+    
+    # Point-in-time recovery
+    point_in_time_recovery: true
+    transaction_log_retention_days: 7
+    
+    # Read replicas
+    read_replicas:
+      - name: nexusforge-db-prod-replica-1
+        region: us-east1
+        tier: db-n1-standard-2
+  
+  # Redis settings
+  redis:
+    instance_name: nexusforge-redis-prod
+    tier: STANDARD_HA
+    memory_size: 5
+    redis_version: REDIS_6_X
+    auth_enabled: true
+    replica_count: 1
+  
+  # Security settings
+  security:
+    enable_vpc_connector: true
+    vpc_connector: nexusforge-vpc-connector-prod
+    ingress: internal-and-cloud-load-balancing
+    egress: private-ranges-only
+    
+    # IAM settings
+    service_account: nexusforge-prod@PROJECT_ID.iam.gserviceaccount.com
+    
+    # Secret Manager
+    secrets_prefix: prod
+    
+    # Cloud Armor
+    cloud_armor_policy: nexusforge-prod-policy
+    
+  # Monitoring settings
+  monitoring:
+    log_level: WARNING
+    enable_profiling: false
+    sample_rate: 0.1
+    alert_enabled: true
+    alert_email: prod-alerts@example.com
+    pager_duty_integration: true
+    
+    # SLO settings
+    slo:
+      availability_target: 99.9
+      latency_p95_ms: 500
+      latency_p99_ms: 1000
+      error_rate_threshold: 0.1
+    
+  # Feature flags
+  features:
+    debug_mode: false
+    verbose_logging: false
+    enable_cors: true
+    rate_limiting: true
+    caching: true
+    cdn_enabled: true
+    
+  # Environment variables
+  env_vars:
+    ENVIRONMENT: production
+    LOG_LEVEL: WARNING
+    ENABLE_SWAGGER: "false"
+    CORS_ORIGINS: "https://app.example.com,https://www.example.com"
+    RATE_LIMIT_ENABLED: "true"
+    RATE_LIMIT_REQUESTS: "1000"
+    RATE_LIMIT_WINDOW: "60"
+    CACHE_TTL: "3600"
+
+# ============================================
+# Deployment Settings by Environment
+# ============================================
+deployment:
+  dev:
+    strategy: rolling
+    health_check_interval: 10
+    health_check_timeout: 30
+    max_unavailable: 1
+    canary_enabled: false
+    rollback_on_error: true
+    
+  staging:
+    strategy: blue-green
+    health_check_interval: 30
+    health_check_timeout: 60
+    max_unavailable: 0
+    canary_enabled: false
+    rollback_on_error: true
+    smoke_tests_required: true
+    
+  prod:
+    strategy: canary
+    health_check_interval: 60
+    health_check_timeout: 120
+    max_unavailable: 0
+    canary_enabled: true
+    canary_percentage: 25
+    canary_duration_minutes: 10
+    rollback_on_error: true
+    smoke_tests_required: true
+    integration_tests_required: true
+
+# ============================================
+# Backup Settings by Environment
+# ============================================
+backup:
+  dev:
+    enabled: true
+    schedule: "0 4 * * *"  # 4 AM daily
+    retention_days: 7
+    backup_types:
+      - database
+      - configuration
+    
+  staging:
+    enabled: true
+    schedule: "0 3 * * *"  # 3 AM daily
+    retention_days: 14
+    backup_types:
+      - database
+      - secrets
+      - configuration
+    
+  prod:
+    enabled: true
+    schedule: "0 2 * * *"  # 2 AM daily
+    retention_days: 30
+    backup_types:
+      - database
+      - secrets
+      - configuration
+    cross_region_replication: true
+    verification_enabled: true
+
+# ============================================
+# Security Scanning Settings
+# ============================================
+security_scanning:
+  dev:
+    enabled: true
+    schedule: "0 6 * * *"  # 6 AM daily
+    scan_types:
+      - code
+      - dependencies
+    severity_threshold: MEDIUM
+    
+  staging:
+    enabled: true
+    schedule: "0 5 * * *"  # 5 AM daily
+    scan_types:
+      - code
+      - containers
+      - dependencies
+    severity_threshold: MEDIUM
+    
+  prod:
+    enabled: true
+    schedule: "0 2 * * *"  # 2 AM daily
+    scan_types:
+      - code
+      - containers
+      - dependencies
+      - secrets
+    severity_threshold: HIGH
+    compliance_checks:
+      - PCI-DSS
+      - SOC2
+      - HIPAA
+
+# ============================================
+# Notification Settings
+# ============================================
+notifications:
+  dev:
+    channels:
+      - slack
+    slack_webhook_secret: DEV_SLACK_WEBHOOK
+    notify_on:
+      - deployment_failure
+    
+  staging:
+    channels:
+      - slack
+      - email
+    slack_webhook_secret: STAGING_SLACK_WEBHOOK
+    email_recipients:
+      - staging-team@example.com
+    notify_on:
+      - deployment_start
+      - deployment_failure
+      - deployment_success
+    
+  prod:
+    channels:
+      - slack
+      - email
+      - pagerduty
+    slack_webhook_secret: PROD_SLACK_WEBHOOK
+    pagerduty_integration_key: PROD_PAGERDUTY_KEY
+    email_recipients:
+      - prod-team@example.com
+      - oncall@example.com
+    notify_on:
+      - deployment_start
+      - deployment_failure
+      - deployment_success
+      - health_check_failure
+      - security_alert

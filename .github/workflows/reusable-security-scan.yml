@@ -1,0 +1,134 @@
+name: Reusable Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      scan_type:
+        description: 'Type of scan (code, container, dependencies, all)'
+        required: false
+        type: string
+        default: 'all'
+      severity:
+        description: 'Minimum severity level to report'
+        required: false
+        type: string
+        default: 'CRITICAL,HIGH,MEDIUM'
+      fail_on_severity:
+        description: 'Exit with error if vulnerabilities found at this level'
+        required: false
+        type: string
+        default: 'CRITICAL'
+      image_ref:
+        description: 'Container image reference for scanning'
+        required: false
+        type: string
+        default: ''
+      working_directory:
+        description: 'Working directory for scans'
+        required: false
+        type: string
+        default: '.'
+      upload_sarif:
+        description: 'Upload SARIF results to GitHub Security'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER:
+        required: false
+      GCP_SERVICE_ACCOUNT:
+        required: false
+      GCP_PROJECT_ID:
+        required: false
+    outputs:
+      vulnerabilities_found:
+        description: 'Number of vulnerabilities found'
+        value: ${{ jobs.security-scan.outputs.vuln_count }}
+      scan_status:
+        description: 'Overall scan status'
+        value: ${{ jobs.security-scan.outputs.status }}
+      critical_count:
+        description: 'Number of critical vulnerabilities'
+        value: ${{ jobs.security-scan.outputs.critical }}
+      high_count:
+        description: 'Number of high vulnerabilities'
+        value: ${{ jobs.security-scan.outputs.high }}
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    outputs:
+      vuln_count: ${{ steps.scan.outputs.vulnerabilities_found }}
+      status: ${{ steps.scan.outputs.scan_status }}
+      critical: ${{ steps.scan.outputs.critical }}
+      high: ${{ steps.scan.outputs.high }}
+    
+    steps:
+      # ============================================
+      # Checkout code
+      # ============================================
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+
+      # ============================================
+      # Setup GCP (if image scanning is needed)
+      # ============================================
+      - name: Setup GCP
+        if: inputs.image_ref != '' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          setup_docker: 'true'
+
+      # ============================================
+      # Run security scan
+      # ============================================
+      - name: Run Security Scan
+        id: scan
+        uses: ./.github/actions/security-scan
+        with:
+          scan_type: ${{ inputs.scan_type }}
+          severity: ${{ inputs.severity }}
+          image_ref: ${{ inputs.image_ref }}
+          fail_on_severity: ${{ inputs.fail_on_severity }}
+          upload_sarif: ${{ inputs.upload_sarif }}
+          working_directory: ${{ inputs.working_directory }}
+
+      # ============================================
+      # Create security report
+      # ============================================
+      - name: Create Security Report
+        if: always()
+        run: |
+          echo "## 🔒 Security Scan Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan Type:** ${{ inputs.scan_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Severity Filter:** ${{ inputs.severity }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ steps.scan.outputs.scan_status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.scan.outputs.scan_status }}" == "passed" ]; then
+            echo "✅ **No significant vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.scan.outputs.scan_status }}" == "warning" ]; then
+            echo "⚠️ **Vulnerabilities found below failure threshold**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Critical vulnerabilities found - Action required**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ============================================
+      # Notify on failure
+      # ============================================
+      - name: Security Scan Failed
+        if: failure()
+        run: |
+          echo "::error::Security scan failed with ${{ inputs.fail_on_severity }} severity vulnerabilities"
+          echo "Please review the security scan results and address the vulnerabilities before proceeding."

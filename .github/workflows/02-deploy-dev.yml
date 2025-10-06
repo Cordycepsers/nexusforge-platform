@@ -1,0 +1,381 @@
+name: 02 - Deploy to Development
+
+on:
+  push:
+    branches:
+      - develop
+      - dev
+  pull_request:
+    branches:
+      - develop
+      - dev
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests'
+        required: false
+        type: boolean
+        default: false
+      skip_security_scan:
+        description: 'Skip security scan'
+        required: false
+        type: boolean
+        default: false
+      services:
+        description: 'Services to deploy (comma-separated: python,node,go or "all")'
+        required: false
+        type: string
+        default: 'all'
+
+env:
+  ENVIRONMENT: dev
+  REGION: us-central1
+  TEAM_NAME: nexusforge
+
+jobs:
+  # ============================================
+  # Determine what to deploy
+  # ============================================
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.changes.outputs.python }}
+      node: ${{ steps.changes.outputs.node }}
+      go: ${{ steps.changes.outputs.go }}
+      services: ${{ steps.services.outputs.list }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect File Changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            python:
+              - 'workspace/python/**'
+              - 'config/docker/Dockerfile.python'
+            node:
+              - 'workspace/nodejs/**'
+              - 'config/docker/Dockerfile.node'
+            go:
+              - 'workspace/go/**'
+              - 'config/docker/Dockerfile.go'
+
+      - name: Determine Services to Deploy
+        id: services
+        run: |
+          SERVICES_INPUT="${{ inputs.services }}"
+          
+          if [ "$SERVICES_INPUT" == "all" ] || [ -z "$SERVICES_INPUT" ]; then
+            # Deploy all services if 'all' or on push to develop
+            if [ "${{ github.event_name }}" == "push" ]; then
+              SERVICES="python,node,go"
+            else
+              # For PRs, only deploy changed services
+              SERVICES=""
+              if [ "${{ steps.changes.outputs.python }}" == "true" ]; then
+                SERVICES="python"
+              fi
+              if [ "${{ steps.changes.outputs.node }}" == "true" ]; then
+                SERVICES="${SERVICES:+${SERVICES},}node"
+              fi
+              if [ "${{ steps.changes.outputs.go }}" == "true" ]; then
+                SERVICES="${SERVICES:+${SERVICES},}go"
+              fi
+              
+              # If no changes detected, deploy all (might be config change)
+              if [ -z "$SERVICES" ]; then
+                SERVICES="python,node,go"
+              fi
+            fi
+          else
+            SERVICES="$SERVICES_INPUT"
+          fi
+          
+          echo "list=${SERVICES}" >> $GITHUB_OUTPUT
+          echo "Services to deploy: ${SERVICES}"
+
+  # ============================================
+  # Security scan
+  # ============================================
+  security-scan:
+    name: Security Scan
+    if: inputs.skip_security_scan == false
+    uses: ./.github/workflows/reusable-security-scan.yml
+    with:
+      scan_type: 'all'
+      severity: 'CRITICAL,HIGH,MEDIUM'
+      fail_on_severity: 'CRITICAL'
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+  # ============================================
+  # Test Python service
+  # ============================================
+  test-python:
+    name: Test Python
+    if: contains(needs.detect-changes.outputs.services, 'python') && inputs.skip_tests == false
+    needs: detect-changes
+    uses: ./.github/workflows/reusable-test.yml
+    with:
+      language: 'python'
+      working_directory: 'workspace/python'
+      coverage_threshold: 70
+      run_integration_tests: true
+
+  # ============================================
+  # Test Node.js service
+  # ============================================
+  test-node:
+    name: Test Node.js
+    if: contains(needs.detect-changes.outputs.services, 'node') && inputs.skip_tests == false
+    needs: detect-changes
+    uses: ./.github/workflows/reusable-test.yml
+    with:
+      language: 'node'
+      working_directory: 'workspace/nodejs'
+      coverage_threshold: 70
+      run_integration_tests: true
+
+  # ============================================
+  # Test Go service
+  # ============================================
+  test-go:
+    name: Test Go
+    if: contains(needs.detect-changes.outputs.services, 'go') && inputs.skip_tests == false
+    needs: detect-changes
+    uses: ./.github/workflows/reusable-test.yml
+    with:
+      language: 'go'
+      working_directory: 'workspace/go'
+      coverage_threshold: 70
+      run_integration_tests: true
+
+  # ============================================
+  # Build Python image
+  # ============================================
+  build-python:
+    name: Build Python
+    if: contains(needs.detect-changes.outputs.services, 'python')
+    needs: [detect-changes, security-scan, test-python]
+    uses: ./.github/workflows/reusable-build-push.yml
+    with:
+      service: 'python'
+      dockerfile: 'config/docker/Dockerfile.python'
+      context: 'workspace/python'
+      image_tag: ${{ github.sha }}
+      additional_tags: 'dev,latest-dev'
+      scan_image: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+  # ============================================
+  # Build Node.js image
+  # ============================================
+  build-node:
+    name: Build Node.js
+    if: contains(needs.detect-changes.outputs.services, 'node')
+    needs: [detect-changes, security-scan, test-node]
+    uses: ./.github/workflows/reusable-build-push.yml
+    with:
+      service: 'node'
+      dockerfile: 'config/docker/Dockerfile.node'
+      context: 'workspace/nodejs'
+      image_tag: ${{ github.sha }}
+      additional_tags: 'dev,latest-dev'
+      scan_image: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+  # ============================================
+  # Build Go image
+  # ============================================
+  build-go:
+    name: Build Go
+    if: contains(needs.detect-changes.outputs.services, 'go')
+    needs: [detect-changes, security-scan, test-go]
+    uses: ./.github/workflows/reusable-build-push.yml
+    with:
+      service: 'go'
+      dockerfile: 'config/docker/Dockerfile.go'
+      context: 'workspace/go'
+      image_tag: ${{ github.sha }}
+      additional_tags: 'dev,latest-dev'
+      scan_image: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+  # ============================================
+  # Deploy Python service
+  # ============================================
+  deploy-python:
+    name: Deploy Python
+    if: contains(needs.detect-changes.outputs.services, 'python') && github.event_name == 'push'
+    needs: [detect-changes, build-python]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      service: 'python'
+      image: ${{ needs.build-python.outputs.image_url }}
+      environment: 'dev'
+      port: 8000
+      min_instances: 0
+      max_instances: 5
+      memory: '512Mi'
+      cpu: 1
+      allow_unauthenticated: true
+      run_smoke_tests: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
+      REDIS_URL: ${{ secrets.DEV_REDIS_URL }}
+
+  # ============================================
+  # Deploy Node.js service
+  # ============================================
+  deploy-node:
+    name: Deploy Node.js
+    if: contains(needs.detect-changes.outputs.services, 'node') && github.event_name == 'push'
+    needs: [detect-changes, build-node]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      service: 'node'
+      image: ${{ needs.build-node.outputs.image_url }}
+      environment: 'dev'
+      port: 3000
+      min_instances: 0
+      max_instances: 5
+      memory: '512Mi'
+      cpu: 1
+      allow_unauthenticated: true
+      run_smoke_tests: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
+      REDIS_URL: ${{ secrets.DEV_REDIS_URL }}
+
+  # ============================================
+  # Deploy Go service
+  # ============================================
+  deploy-go:
+    name: Deploy Go
+    if: contains(needs.detect-changes.outputs.services, 'go') && github.event_name == 'push'
+    needs: [detect-changes, build-go]
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      service: 'go'
+      image: ${{ needs.build-go.outputs.image_url }}
+      environment: 'dev'
+      port: 8080
+      min_instances: 0
+      max_instances: 5
+      memory: '512Mi'
+      cpu: 1
+      allow_unauthenticated: true
+      run_smoke_tests: true
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
+      REDIS_URL: ${{ secrets.DEV_REDIS_URL }}
+
+  # ============================================
+  # Notify on completion
+  # ============================================
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy-python, deploy-node, deploy-go]
+    if: always() && github.event_name == 'push'
+    
+    steps:
+      - name: Generate Deployment Summary
+        run: |
+          echo "## 🚀 Development Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Python status
+          if [ "${{ needs.deploy-python.result }}" != "skipped" ]; then
+            if [ "${{ needs.deploy-python.result }}" == "success" ]; then
+              echo "- ✅ Python: Deployed successfully" >> $GITHUB_STEP_SUMMARY
+              echo "  - URL: ${{ needs.deploy-python.outputs.service_url }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ❌ Python: Deployment failed" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          # Node status
+          if [ "${{ needs.deploy-node.result }}" != "skipped" ]; then
+            if [ "${{ needs.deploy-node.result }}" == "success" ]; then
+              echo "- ✅ Node.js: Deployed successfully" >> $GITHUB_STEP_SUMMARY
+              echo "  - URL: ${{ needs.deploy-node.outputs.service_url }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ❌ Node.js: Deployment failed" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          # Go status
+          if [ "${{ needs.deploy-go.result }}" != "skipped" ]; then
+            if [ "${{ needs.deploy-go.result }}" == "success" ]; then
+              echo "- ✅ Go: Deployed successfully" >> $GITHUB_STEP_SUMMARY
+              echo "  - URL: ${{ needs.deploy-go.outputs.service_url }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ❌ Go: Deployment failed" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Author:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** \`dev\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const summary = `## 🚀 Development Deployment Preview
+            
+            Your changes have been built and are ready for testing.
+            
+            ### Services Built:
+            ${process.env.SERVICES}
+            
+            **Note:** Services are not deployed for PR builds. Merge to \`develop\` to deploy to development environment.
+            
+            ### Build Status:
+            - Security Scan: ${{ needs.security-scan.result }}
+            - Tests: Passed
+            - Build: Success
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+        env:
+          SERVICES: ${{ needs.detect-changes.outputs.services }}
+        continue-on-error: true

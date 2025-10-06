@@ -1,0 +1,422 @@
+name: 'Run Tests'
+description: 'Run tests for Python, Node.js, or Go with coverage reporting'
+author: 'NexusForge Team'
+
+inputs:
+  language:
+    description: 'Programming language (python, node, go)'
+    required: true
+  working_directory:
+    description: 'Working directory for tests'
+    required: false
+    default: '.'
+  test_command:
+    description: 'Custom test command (overrides default)'
+    required: false
+    default: ''
+  coverage:
+    description: 'Generate coverage report'
+    required: false
+    default: 'true'
+  coverage_threshold:
+    description: 'Minimum coverage percentage required'
+    required: false
+    default: '0'
+  upload_coverage:
+    description: 'Upload coverage to artifacts'
+    required: false
+    default: 'true'
+  fail_fast:
+    description: 'Stop on first test failure'
+    required: false
+    default: 'false'
+  parallel:
+    description: 'Run tests in parallel'
+    required: false
+    default: 'true'
+
+outputs:
+  coverage_percentage:
+    description: 'Test coverage percentage'
+    value: ${{ steps.report.outputs.coverage }}
+  tests_passed:
+    description: 'Number of tests passed'
+    value: ${{ steps.report.outputs.passed }}
+  tests_failed:
+    description: 'Number of tests failed'
+    value: ${{ steps.report.outputs.failed }}
+  test_status:
+    description: 'Overall test status (passed, failed)'
+    value: ${{ steps.report.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ============================================
+    # Setup Python environment
+    # ============================================
+    - name: Setup Python
+      if: inputs.language == 'python'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+        cache: 'pip'
+
+    - name: Install Python Dependencies
+      if: inputs.language == 'python'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        echo "::group::Install Python dependencies"
+        
+        # Upgrade pip
+        python -m pip install --upgrade pip
+        
+        # Install dependencies
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        fi
+        
+        # Install dev dependencies
+        if [ -f requirements-dev.txt ]; then
+          pip install -r requirements-dev.txt
+        fi
+        
+        # Install testing packages
+        pip install pytest pytest-cov pytest-xdist pytest-html pytest-json-report
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Setup Node.js environment
+    # ============================================
+    - name: Setup Node.js
+      if: inputs.language == 'node'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '16'
+        cache: 'npm'
+        cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
+
+    - name: Install Node.js Dependencies
+      if: inputs.language == 'node'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        echo "::group::Install Node.js dependencies"
+        
+        npm ci
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Setup Go environment
+    # ============================================
+    - name: Setup Go
+      if: inputs.language == 'go'
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.18'
+        cache: true
+        cache-dependency-path: ${{ inputs.working_directory }}/go.sum
+
+    - name: Install Go Dependencies
+      if: inputs.language == 'go'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        echo "::group::Install Go dependencies"
+        
+        go mod download
+        go mod verify
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Create test results directory
+    # ============================================
+    - name: Create Test Results Directory
+      shell: bash
+      run: |
+        mkdir -p test-results
+        echo "TEST_RESULTS_DIR=$(pwd)/test-results" >> $GITHUB_ENV
+
+    # ============================================
+    # Run Python tests
+    # ============================================
+    - name: Run Python Tests
+      if: inputs.language == 'python'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        echo "::group::Run Python tests"
+        
+        # Determine test command
+        if [ -n "${{ inputs.test_command }}" ]; then
+          TEST_CMD="${{ inputs.test_command }}"
+        else
+          TEST_CMD="pytest"
+          
+          # Add parallel execution
+          if [ "${{ inputs.parallel }}" == "true" ]; then
+            TEST_CMD="${TEST_CMD} -n auto"
+          fi
+          
+          # Add coverage
+          if [ "${{ inputs.coverage }}" == "true" ]; then
+            TEST_CMD="${TEST_CMD} --cov=. --cov-report=xml --cov-report=html --cov-report=term"
+          fi
+          
+          # Add fail fast
+          if [ "${{ inputs.fail_fast }}" == "true" ]; then
+            TEST_CMD="${TEST_CMD} -x"
+          fi
+          
+          # Add verbose output
+          TEST_CMD="${TEST_CMD} -v"
+          
+          # Add JSON report
+          TEST_CMD="${TEST_CMD} --json-report --json-report-file=$TEST_RESULTS_DIR/pytest-report.json"
+          
+          # Add HTML report
+          TEST_CMD="${TEST_CMD} --html=$TEST_RESULTS_DIR/pytest-report.html --self-contained-html"
+        fi
+        
+        echo "Running: ${TEST_CMD}"
+        
+        # Run tests
+        eval ${TEST_CMD}
+        
+        # Copy coverage reports
+        if [ "${{ inputs.coverage }}" == "true" ]; then
+          cp coverage.xml $TEST_RESULTS_DIR/ || true
+          cp -r htmlcov $TEST_RESULTS_DIR/ || true
+        fi
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Run Node.js tests
+    # ============================================
+    - name: Run Node.js Tests
+      if: inputs.language == 'node'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        echo "::group::Run Node.js tests"
+        
+        # Determine test command
+        if [ -n "${{ inputs.test_command }}" ]; then
+          TEST_CMD="${{ inputs.test_command }}"
+        else
+          TEST_CMD="npm test"
+          
+          # Add coverage
+          if [ "${{ inputs.coverage }}" == "true" ]; then
+            TEST_CMD="${TEST_CMD} -- --coverage --coverageReporters=json --coverageReporters=html --coverageReporters=text"
+          fi
+        fi
+        
+        echo "Running: ${TEST_CMD}"
+        
+        # Set environment for CI
+        export CI=true
+        
+        # Run tests
+        eval ${TEST_CMD}
+        
+        # Copy coverage reports
+        if [ "${{ inputs.coverage }}" == "true" ]; then
+          cp coverage/coverage-final.json $TEST_RESULTS_DIR/ || true
+          cp -r coverage $TEST_RESULTS_DIR/ || true
+        fi
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Run Go tests
+    # ============================================
+    - name: Run Go Tests
+      if: inputs.language == 'go'
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        echo "::group::Run Go tests"
+        
+        # Determine test command
+        if [ -n "${{ inputs.test_command }}" ]; then
+          TEST_CMD="${{ inputs.test_command }}"
+        else
+          TEST_CMD="go test ./..."
+          
+          # Add verbose output
+          TEST_CMD="${TEST_CMD} -v"
+          
+          # Add race detection
+          TEST_CMD="${TEST_CMD} -race"
+          
+          # Add coverage
+          if [ "${{ inputs.coverage }}" == "true" ]; then
+            TEST_CMD="${TEST_CMD} -coverprofile=coverage.out -covermode=atomic"
+          fi
+          
+          # Add parallel execution
+          if [ "${{ inputs.parallel }}" == "true" ]; then
+            TEST_CMD="${TEST_CMD} -parallel 4"
+          fi
+          
+          # Add fail fast
+          if [ "${{ inputs.fail_fast }}" == "true" ]; then
+            TEST_CMD="${TEST_CMD} -failfast"
+          fi
+          
+          # Add JSON output
+          TEST_CMD="${TEST_CMD} -json"
+        fi
+        
+        echo "Running: ${TEST_CMD}"
+        
+        # Run tests and save JSON output
+        eval ${TEST_CMD} | tee $TEST_RESULTS_DIR/go-test-output.json
+        
+        # Generate coverage HTML report
+        if [ "${{ inputs.coverage }}" == "true" ] && [ -f coverage.out ]; then
+          go tool cover -html=coverage.out -o $TEST_RESULTS_DIR/coverage.html
+          cp coverage.out $TEST_RESULTS_DIR/
+        fi
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Parse test results
+    # ============================================
+    - name: Parse Test Results
+      id: report
+      shell: bash
+      run: |
+        echo "::group::Parse test results"
+        
+        PASSED=0
+        FAILED=0
+        COVERAGE=0
+        STATUS="passed"
+        
+        # Parse results based on language
+        case "${{ inputs.language }}" in
+          python)
+            if [ -f "$TEST_RESULTS_DIR/pytest-report.json" ]; then
+              if command -v jq &> /dev/null; then
+                PASSED=$(jq -r '.summary.passed // 0' "$TEST_RESULTS_DIR/pytest-report.json")
+                FAILED=$(jq -r '.summary.failed // 0' "$TEST_RESULTS_DIR/pytest-report.json")
+              fi
+            fi
+            
+            # Get coverage from coverage.xml
+            if [ -f "$TEST_RESULTS_DIR/coverage.xml" ]; then
+              COVERAGE=$(grep -oP 'line-rate="\K[0-9.]+' "$TEST_RESULTS_DIR/coverage.xml" | head -1 | awk '{print int($1*100)}')
+            fi
+            ;;
+            
+          node)
+            # Parse from npm test output
+            if [ -f "$TEST_RESULTS_DIR/coverage-final.json" ]; then
+              if command -v jq &> /dev/null; then
+                COVERAGE=$(jq -r '[.[].lines.pct] | add / length | floor' "$TEST_RESULTS_DIR/coverage-final.json" 2>/dev/null || echo 0)
+              fi
+            fi
+            ;;
+            
+          go)
+            # Parse from go test JSON output
+            if [ -f "$TEST_RESULTS_DIR/go-test-output.json" ]; then
+              PASSED=$(grep -c '"Action":"pass"' "$TEST_RESULTS_DIR/go-test-output.json" || echo 0)
+              FAILED=$(grep -c '"Action":"fail"' "$TEST_RESULTS_DIR/go-test-output.json" || echo 0)
+            fi
+            
+            # Get coverage
+            if [ -f "$TEST_RESULTS_DIR/coverage.out" ]; then
+              COVERAGE=$(go tool cover -func="$TEST_RESULTS_DIR/coverage.out" | grep total | awk '{print int($3)}')
+            fi
+            ;;
+        esac
+        
+        # Determine status
+        if [ $FAILED -gt 0 ]; then
+          STATUS="failed"
+        fi
+        
+        # Check coverage threshold
+        if [ "${{ inputs.coverage_threshold }}" != "0" ] && [ $COVERAGE -lt ${{ inputs.coverage_threshold }} ]; then
+          echo "::warning::Coverage ${COVERAGE}% is below threshold ${{ inputs.coverage_threshold }}%"
+        fi
+        
+        # Set outputs
+        echo "passed=${PASSED}" >> $GITHUB_OUTPUT
+        echo "failed=${FAILED}" >> $GITHUB_OUTPUT
+        echo "coverage=${COVERAGE}" >> $GITHUB_OUTPUT
+        echo "status=${STATUS}" >> $GITHUB_OUTPUT
+        
+        echo "Tests passed: ${PASSED}"
+        echo "Tests failed: ${FAILED}"
+        echo "Coverage: ${COVERAGE}%"
+        echo "Status: ${STATUS}"
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Upload coverage reports
+    # ============================================
+    - name: Upload Coverage to Codecov
+      if: inputs.coverage == 'true' && inputs.upload_coverage == 'true'
+      uses: codecov/codecov-action@v4
+      with:
+        directory: ${{ inputs.working_directory }}
+        flags: ${{ inputs.language }}
+        name: ${{ inputs.language }}-coverage
+      continue-on-error: true
+
+    # ============================================
+    # Upload test results
+    # ============================================
+    - name: Upload Test Results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ inputs.language }}
+        path: test-results/
+        retention-days: 30
+
+    # ============================================
+    # Generate test summary
+    # ============================================
+    - name: Generate Test Summary
+      shell: bash
+      run: |
+        echo "### Test Results - ${{ inputs.language }} ✓" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Language | \`${{ inputs.language }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Tests Passed | ${{ steps.report.outputs.passed }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Tests Failed | ${{ steps.report.outputs.failed }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Coverage | ${{ steps.report.outputs.coverage }}% |" >> $GITHUB_STEP_SUMMARY
+        echo "| Status | ${{ steps.report.outputs.status }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.report.outputs.coverage }}" != "0" ]; then
+          echo "#### Coverage Details" >> $GITHUB_STEP_SUMMARY
+          echo "View detailed coverage reports in the test artifacts." >> $GITHUB_STEP_SUMMARY
+        fi
+
+    # ============================================
+    # Check test status
+    # ============================================
+    - name: Check Test Status
+      shell: bash
+      run: |
+        if [ "${{ steps.report.outputs.status }}" == "failed" ]; then
+          echo "::error::Tests failed with ${{ steps.report.outputs.failed }} failures"
+          exit 1
+        else
+          echo "::notice::All tests passed successfully"
+        fi

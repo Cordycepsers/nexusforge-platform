@@ -1,0 +1,573 @@
+# ============================================
+# NexusForge Platform - Service Configuration
+# ============================================
+# Centralized service-specific settings for all applications
+# Defines build, test, and deployment configurations for each service
+
+# ============================================
+# Service Registry
+# ============================================
+services:
+  python:
+    enabled: true
+    type: api
+    language: python
+    version: "3.9"
+    
+  node:
+    enabled: true
+    type: api
+    language: nodejs
+    version: "16"
+    
+  go:
+    enabled: true
+    type: api
+    language: go
+    version: "1.18"
+
+# ============================================
+# Python Service Configuration
+# ============================================
+python:
+  # Metadata
+  metadata:
+    name: python
+    display_name: "Python FastAPI Service"
+    description: "RESTful API service built with FastAPI"
+    icon: "🐍"
+    owner: backend-team
+    repository: workspace/python
+    documentation: docs/python-service.md
+  
+  # Build configuration
+  build:
+    dockerfile: config/docker/Dockerfile.python
+    context: workspace/python
+    target: production
+    build_args:
+      - PYTHON_VERSION=3.9
+      - APP_PORT=8000
+    cache_from:
+      - type=registry,ref=${REGION}-docker.pkg.dev/${PROJECT_ID}/nexusforge-docker/python:cache
+    cache_to:
+      - type=registry,ref=${REGION}-docker.pkg.dev/${PROJECT_ID}/nexusforge-docker/python:cache,mode=max
+    platforms:
+      - linux/amd64
+      - linux/arm64
+  
+  # Testing configuration
+  test:
+    framework: pytest
+    test_command: pytest
+    coverage_command: pytest --cov=app --cov-report=xml --cov-report=html
+    test_paths:
+      - tests/unit
+      - tests/integration
+    coverage_threshold: 80
+    parallel: true
+    max_workers: 4
+    
+    # Test environment
+    env_vars:
+      TESTING: "true"
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+      REDIS_URL: redis://localhost:6379/0
+    
+    # Dependencies for testing
+    services:
+      postgres:
+        image: postgres:14-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:6-alpine
+        ports:
+          - 6379:6379
+  
+  # Linting and formatting
+  lint:
+    tools:
+      - name: pylint
+        command: pylint app
+        config: .pylintrc
+      - name: black
+        command: black --check app tests
+      - name: isort
+        command: isort --check-only app tests
+      - name: mypy
+        command: mypy app
+        config: pyproject.toml
+    fix_command: black app tests && isort app tests
+  
+  # Security scanning
+  security:
+    tools:
+      - name: bandit
+        command: bandit -r app -f json -o bandit-report.json
+      - name: safety
+        command: safety check --json --output safety-report.json
+  
+  # Deployment configuration
+  deploy:
+    port: 8000
+    health_check_path: /health
+    readiness_check_path: /ready
+    startup_probe_path: /startup
+    
+    # Cloud Run specific
+    cloud_run:
+      service_name_template: "${TEAM_NAME}-python-${ENVIRONMENT}"
+      startup_timeout: 300
+      request_timeout: 300
+      
+      # Environment variables
+      env_vars:
+        APP_NAME: nexusforge-python
+        PORT: "8000"
+        WORKERS: "4"
+        RELOAD: "false"
+      
+      # Secrets from Secret Manager
+      secrets:
+        - name: DATABASE_URL
+          key: python-database-url
+          version: latest
+        - name: REDIS_URL
+          key: python-redis-url
+          version: latest
+        - name: SECRET_KEY
+          key: python-secret-key
+          version: latest
+        - name: API_KEY
+          key: python-api-key
+          version: latest
+  
+  # Dependencies
+  dependencies:
+    runtime:
+      - fastapi==0.104.1
+      - uvicorn[standard]==0.24.0
+      - pydantic==2.5.0
+      - sqlalchemy==2.0.23
+      - asyncpg==0.29.0
+      - redis==5.0.1
+      - python-jose[cryptography]==3.3.0
+      - passlib[bcrypt]==1.7.4
+      - python-multipart==0.0.6
+      - alembic==1.13.0
+    
+    dev:
+      - pytest==7.4.3
+      - pytest-cov==4.1.0
+      - pytest-asyncio==0.21.1
+      - black==23.11.0
+      - isort==5.12.0
+      - pylint==3.0.3
+      - mypy==1.7.1
+      - bandit==1.7.5
+      - safety==2.3.5
+
+# ============================================
+# Node.js Service Configuration
+# ============================================
+node:
+  # Metadata
+  metadata:
+    name: node
+    display_name: "Node.js Express Service"
+    description: "RESTful API service built with Express and TypeScript"
+    icon: "📦"
+    owner: backend-team
+    repository: workspace/nodejs
+    documentation: docs/node-service.md
+  
+  # Build configuration
+  build:
+    dockerfile: config/docker/Dockerfile.node
+    context: workspace/nodejs
+    target: production
+    build_args:
+      - NODE_VERSION=16
+      - APP_PORT=3000
+    cache_from:
+      - type=registry,ref=${REGION}-docker.pkg.dev/${PROJECT_ID}/nexusforge-docker/node:cache
+    cache_to:
+      - type=registry,ref=${REGION}-docker.pkg.dev/${PROJECT_ID}/nexusforge-docker/node:cache,mode=max
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    
+    # Build steps
+    pre_build:
+      - npm ci
+      - npm run build
+  
+  # Testing configuration
+  test:
+    framework: jest
+    test_command: npm test
+    coverage_command: npm run test:coverage
+    test_paths:
+      - src/**/*.spec.ts
+      - tests/**/*.test.ts
+    coverage_threshold: 80
+    parallel: true
+    max_workers: 4
+    
+    # Test environment
+    env_vars:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+      REDIS_URL: redis://localhost:6379/0
+    
+    # Dependencies for testing
+    services:
+      postgres:
+        image: postgres:14-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:6-alpine
+        ports:
+          - 6379:6379
+  
+  # Linting and formatting
+  lint:
+    tools:
+      - name: eslint
+        command: npm run lint
+        config: .eslintrc.js
+      - name: prettier
+        command: npm run format:check
+        config: .prettierrc
+      - name: tsc
+        command: npm run type-check
+        config: tsconfig.json
+    fix_command: npm run lint:fix && npm run format
+  
+  # Security scanning
+  security:
+    tools:
+      - name: npm-audit
+        command: npm audit --json --audit-level=moderate
+      - name: snyk
+        command: npx snyk test --json
+  
+  # Deployment configuration
+  deploy:
+    port: 3000
+    health_check_path: /health
+    readiness_check_path: /ready
+    startup_probe_path: /startup
+    
+    # Cloud Run specific
+    cloud_run:
+      service_name_template: "${TEAM_NAME}-node-${ENVIRONMENT}"
+      startup_timeout: 300
+      request_timeout: 300
+      
+      # Environment variables
+      env_vars:
+        APP_NAME: nexusforge-node
+        PORT: "3000"
+        NODE_ENV: production
+      
+      # Secrets from Secret Manager
+      secrets:
+        - name: DATABASE_URL
+          key: node-database-url
+          version: latest
+        - name: REDIS_URL
+          key: node-redis-url
+          version: latest
+        - name: JWT_SECRET
+          key: node-jwt-secret
+          version: latest
+        - name: API_KEY
+          key: node-api-key
+          version: latest
+  
+  # Dependencies
+  dependencies:
+    runtime:
+      express: "^4.18.2"
+      typescript: "^5.3.2"
+      "@types/express": "^4.17.21"
+      "@types/node": "^20.10.0"
+      prisma: "^5.6.0"
+      "@prisma/client": "^5.6.0"
+      redis: "^4.6.11"
+      jsonwebtoken: "^9.0.2"
+      bcrypt: "^5.1.1"
+      dotenv: "^16.3.1"
+      helmet: "^7.1.0"
+      cors: "^2.8.5"
+      compression: "^1.7.4"
+      morgan: "^1.10.0"
+    
+    dev:
+      jest: "^29.7.0"
+      ts-jest: "^29.1.1"
+      "@types/jest": "^29.5.8"
+      eslint: "^8.54.0"
+      "@typescript-eslint/eslint-plugin": "^6.12.0"
+      "@typescript-eslint/parser": "^6.12.0"
+      prettier: "^3.1.0"
+      ts-node: "^10.9.1"
+      nodemon: "^3.0.2"
+
+# ============================================
+# Go Service Configuration
+# ============================================
+go:
+  # Metadata
+  metadata:
+    name: go
+    display_name: "Go HTTP Service"
+    description: "High-performance HTTP service built with Go"
+    icon: "🐹"
+    owner: backend-team
+    repository: workspace/go
+    documentation: docs/go-service.md
+  
+  # Build configuration
+  build:
+    dockerfile: config/docker/Dockerfile.go
+    context: workspace/go
+    target: production
+    build_args:
+      - GO_VERSION=1.18
+      - APP_PORT=8080
+    cache_from:
+      - type=registry,ref=${REGION}-docker.pkg.dev/${PROJECT_ID}/nexusforge-docker/go:cache
+    cache_to:
+      - type=registry,ref=${REGION}-docker.pkg.dev/${PROJECT_ID}/nexusforge-docker/go:cache,mode=max
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    
+    # Build configuration
+    ldflags: "-w -s -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}"
+    tags:
+      - netgo
+  
+  # Testing configuration
+  test:
+    framework: go-test
+    test_command: go test ./... -v
+    coverage_command: go test ./... -coverprofile=coverage.out -covermode=atomic
+    test_paths:
+      - ./...
+    coverage_threshold: 80
+    parallel: true
+    race_detection: true
+    
+    # Test environment
+    env_vars:
+      GO_ENV: test
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+      REDIS_URL: redis://localhost:6379/0
+    
+    # Dependencies for testing
+    services:
+      postgres:
+        image: postgres:14-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:6-alpine
+        ports:
+          - 6379:6379
+  
+  # Linting and formatting
+  lint:
+    tools:
+      - name: golangci-lint
+        command: golangci-lint run
+        config: .golangci.yml
+      - name: gofmt
+        command: gofmt -l .
+      - name: go-vet
+        command: go vet ./...
+      - name: staticcheck
+        command: staticcheck ./...
+    fix_command: gofmt -w . && golangci-lint run --fix
+  
+  # Security scanning
+  security:
+    tools:
+      - name: gosec
+        command: gosec -fmt=json -out=gosec-report.json ./...
+      - name: govulncheck
+        command: govulncheck ./...
+  
+  # Deployment configuration
+  deploy:
+    port: 8080
+    health_check_path: /health
+    readiness_check_path: /ready
+    startup_probe_path: /startup
+    
+    # Cloud Run specific
+    cloud_run:
+      service_name_template: "${TEAM_NAME}-go-${ENVIRONMENT}"
+      startup_timeout: 300
+      request_timeout: 300
+      
+      # Environment variables
+      env_vars:
+        APP_NAME: nexusforge-go
+        PORT: "8080"
+        GO_ENV: production
+        GOMAXPROCS: "2"
+      
+      # Secrets from Secret Manager
+      secrets:
+        - name: DATABASE_URL
+          key: go-database-url
+          version: latest
+        - name: REDIS_URL
+          key: go-redis-url
+          version: latest
+        - name: JWT_SECRET
+          key: go-jwt-secret
+          version: latest
+        - name: API_KEY
+          key: go-api-key
+          version: latest
+  
+  # Dependencies
+  dependencies:
+    runtime:
+      - github.com/gin-gonic/gin v1.9.1
+      - github.com/lib/pq v1.10.9
+      - github.com/go-redis/redis/v8 v8.11.5
+      - github.com/golang-jwt/jwt/v5 v5.2.0
+      - golang.org/x/crypto v0.16.0
+      - github.com/joho/godotenv v1.5.1
+    
+    dev:
+      - github.com/stretchr/testify v1.8.4
+      - github.com/golang/mock v1.6.0
+
+# ============================================
+# Cross-Service Configuration
+# ============================================
+cross_service:
+  # API Gateway settings
+  api_gateway:
+    enabled: false
+    provider: nginx
+    config_file: config/nginx/nginx-all-in-one.conf
+  
+  # Service mesh
+  service_mesh:
+    enabled: false
+    provider: istio
+  
+  # Shared dependencies
+  shared_services:
+    postgres:
+      version: "14"
+      image: postgres:14-alpine
+      port: 5432
+    
+    redis:
+      version: "6"
+      image: redis:6-alpine
+      port: 6379
+    
+    nginx:
+      version: "1.25"
+      image: nginx:1.25-alpine
+      port: 80
+  
+  # Monitoring
+  monitoring:
+    prometheus:
+      enabled: true
+      scrape_interval: 30s
+      scrape_paths:
+        python: /metrics
+        node: /metrics
+        go: /metrics
+    
+    grafana:
+      enabled: true
+      dashboards:
+        - overview
+        - application
+        - infrastructure
+  
+  # Tracing
+  tracing:
+    enabled: true
+    provider: cloud-trace
+    sample_rate: 0.1
+  
+  # Logging
+  logging:
+    provider: cloud-logging
+    structured: true
+    format: json
+    fields:
+      - timestamp
+      - level
+      - service
+      - trace_id
+      - span_id
+      - message
+
+# ============================================
+# Build Order and Dependencies
+# ============================================
+build_order:
+  - go         # Fastest build
+  - python     # Medium build time
+  - node       # Slowest build (npm install)
+
+service_dependencies:
+  python:
+    depends_on:
+      - postgres
+      - redis
+  
+  node:
+    depends_on:
+      - postgres
+      - redis
+  
+  go:
+    depends_on:
+      - postgres
+      - redis
+
+# ============================================
+# Deployment Matrix
+# ============================================
+deployment_matrix:
+  # Which services to deploy to which environments
+  dev:
+    - python
+    - node
+    - go
+  
+  staging:
+    - python
+    - node
+    - go
+  
+  prod:
+    - python
+    - node
+    - go

@@ -1,0 +1,280 @@
+name: Reusable Test Workflow
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: 'Programming language (python, node, go)'
+        required: true
+        type: string
+      working_directory:
+        description: 'Working directory for tests'
+        required: false
+        type: string
+        default: '.'
+      test_command:
+        description: 'Custom test command'
+        required: false
+        type: string
+        default: ''
+      coverage_threshold:
+        description: 'Minimum coverage percentage required'
+        required: false
+        type: number
+        default: 0
+      run_integration_tests:
+        description: 'Run integration tests'
+        required: false
+        type: boolean
+        default: true
+      run_e2e_tests:
+        description: 'Run end-to-end tests'
+        required: false
+        type: boolean
+        default: false
+      parallel:
+        description: 'Run tests in parallel'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      coverage_percentage:
+        description: 'Test coverage percentage'
+        value: ${{ jobs.test.outputs.coverage }}
+      tests_passed:
+        description: 'Number of tests passed'
+        value: ${{ jobs.test.outputs.passed }}
+      tests_failed:
+        description: 'Number of tests failed'
+        value: ${{ jobs.test.outputs.failed }}
+      test_status:
+        description: 'Overall test status'
+        value: ${{ jobs.test.outputs.status }}
+
+jobs:
+  test:
+    name: Test ${{ inputs.language }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    outputs:
+      coverage: ${{ steps.run-tests.outputs.coverage_percentage }}
+      passed: ${{ steps.run-tests.outputs.tests_passed }}
+      failed: ${{ steps.run-tests.outputs.tests_failed }}
+      status: ${{ steps.run-tests.outputs.test_status }}
+    
+    steps:
+      # ============================================
+      # Checkout code
+      # ============================================
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ============================================
+      # Setup test database (if needed)
+      # ============================================
+      - name: Setup PostgreSQL
+        if: inputs.run_integration_tests
+        uses: ankane/setup-postgres@v1
+        with:
+          postgres-version: 14
+          database: test_db
+
+      - name: Setup Redis
+        if: inputs.run_integration_tests
+        uses: shogo82148/actions-setup-redis@v1
+        with:
+          redis-version: '7.x'
+
+      # ============================================
+      # Run unit tests
+      # ============================================
+      - name: Run Unit Tests
+        id: run-tests
+        uses: ./.github/actions/run-tests
+        with:
+          language: ${{ inputs.language }}
+          working_directory: ${{ inputs.working_directory }}
+          test_command: ${{ inputs.test_command }}
+          coverage: 'true'
+          coverage_threshold: ${{ inputs.coverage_threshold }}
+          parallel: ${{ inputs.parallel }}
+
+      # ============================================
+      # Run integration tests (if enabled)
+      # ============================================
+      - name: Run Integration Tests
+        if: inputs.run_integration_tests && steps.run-tests.outputs.test_status == 'passed'
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          echo "::group::Run integration tests"
+          
+          case "${{ inputs.language }}" in
+            python)
+              if [ -f "pytest.ini" ]; then
+                pytest tests/integration/ -v || true
+              fi
+              ;;
+            node)
+              if [ -f "package.json" ]; then
+                npm run test:integration || true
+              fi
+              ;;
+            go)
+              if [ -d "tests/integration" ]; then
+                go test ./tests/integration/... -v || true
+              fi
+              ;;
+          esac
+          
+          echo "::endgroup::"
+
+      # ============================================
+      # Run E2E tests (if enabled)
+      # ============================================
+      - name: Run E2E Tests
+        if: inputs.run_e2e_tests && steps.run-tests.outputs.test_status == 'passed'
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          echo "::group::Run end-to-end tests"
+          
+          case "${{ inputs.language }}" in
+            python)
+              if [ -d "tests/e2e" ]; then
+                pytest tests/e2e/ -v || true
+              fi
+              ;;
+            node)
+              if [ -f "package.json" ]; then
+                npm run test:e2e || true
+              fi
+              ;;
+            go)
+              if [ -d "tests/e2e" ]; then
+                go test ./tests/e2e/... -v || true
+              fi
+              ;;
+          esac
+          
+          echo "::endgroup::"
+
+      # ============================================
+      # Generate test badge
+      # ============================================
+      - name: Generate Test Badge
+        if: always()
+        run: |
+          STATUS="${{ steps.run-tests.outputs.test_status }}"
+          COVERAGE="${{ steps.run-tests.outputs.coverage_percentage }}"
+          
+          if [ "$STATUS" == "passed" ]; then
+            BADGE_COLOR="success"
+            BADGE_ICON="✅"
+          else
+            BADGE_COLOR="critical"
+            BADGE_ICON="❌"
+          fi
+          
+          echo "## 🧪 Test Results - ${{ inputs.language }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "![Status](https://img.shields.io/badge/tests-${STATUS}-${BADGE_COLOR})" >> $GITHUB_STEP_SUMMARY
+          echo "![Coverage](https://img.shields.io/badge/coverage-${COVERAGE}%25-blue)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "${BADGE_ICON} **Status:** ${STATUS}" >> $GITHUB_STEP_SUMMARY
+          echo "📊 **Coverage:** ${COVERAGE}%" >> $GITHUB_STEP_SUMMARY
+          echo "✓ **Passed:** ${{ steps.run-tests.outputs.tests_passed }}" >> $GITHUB_STEP_SUMMARY
+          echo "✗ **Failed:** ${{ steps.run-tests.outputs.tests_failed }}" >> $GITHUB_STEP_SUMMARY
+
+      # ============================================
+      # Check coverage threshold
+      # ============================================
+      - name: Check Coverage Threshold
+        if: inputs.coverage_threshold > 0
+        run: |
+          COVERAGE="${{ steps.run-tests.outputs.coverage_percentage }}"
+          THRESHOLD="${{ inputs.coverage_threshold }}"
+          
+          if [ "$COVERAGE" -lt "$THRESHOLD" ]; then
+            echo "::error::Coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+            exit 1
+          else
+            echo "::notice::Coverage ${COVERAGE}% meets threshold ${THRESHOLD}%"
+          fi
+
+      # ============================================
+      # Upload test artifacts
+      # ============================================
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ inputs.language }}-${{ github.run_number }}
+          path: |
+            test-results/
+            **/coverage/
+            **/htmlcov/
+            **/*.xml
+            **/*.html
+          retention-days: 30
+
+  # ============================================
+  # Publish test results
+  # ============================================
+  publish-results:
+    name: Publish Test Results
+    runs-on: ubuntu-latest
+    needs: test
+    if: always()
+    permissions:
+      checks: write
+      pull-requests: write
+    
+    steps:
+      - name: Download Test Results
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results-${{ inputs.language }}-${{ github.run_number }}
+          path: test-results
+
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: |
+            test-results/**/*.xml
+          comment_mode: off
+          check_name: Test Results - ${{ inputs.language }}
+        continue-on-error: true
+
+      - name: Comment PR with Test Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const coverage = '${{ needs.test.outputs.coverage }}';
+            const passed = '${{ needs.test.outputs.passed }}';
+            const failed = '${{ needs.test.outputs.failed }}';
+            const status = '${{ needs.test.outputs.status }}';
+            
+            const body = `## 🧪 Test Results - ${{ inputs.language }}
+            
+            | Metric | Value |
+            |--------|-------|
+            | Status | ${status === 'passed' ? '✅ Passed' : '❌ Failed'} |
+            | Tests Passed | ${passed} |
+            | Tests Failed | ${failed} |
+            | Coverage | ${coverage}% |
+            
+            ${status === 'failed' ? '⚠️ Please fix failing tests before merging.' : ''}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+        continue-on-error: true

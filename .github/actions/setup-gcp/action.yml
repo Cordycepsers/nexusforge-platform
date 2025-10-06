@@ -1,0 +1,169 @@
+name: 'Setup GCP Environment'
+description: 'Authenticate to GCP and configure gcloud CLI with Workload Identity Federation'
+author: 'NexusForge Team'
+
+inputs:
+  workload_identity_provider:
+    description: 'Workload Identity Provider resource name'
+    required: true
+  service_account:
+    description: 'Service Account email for impersonation'
+    required: true
+  project_id:
+    description: 'GCP Project ID'
+    required: true
+  region:
+    description: 'GCP Region'
+    required: false
+    default: 'us-central1'
+  zone:
+    description: 'GCP Zone'
+    required: false
+    default: 'us-central1-a'
+  setup_docker:
+    description: 'Configure Docker for Artifact Registry'
+    required: false
+    default: 'true'
+  install_gke_auth:
+    description: 'Install GKE authentication plugin'
+    required: false
+    default: 'false'
+
+outputs:
+  project_id:
+    description: 'Configured GCP Project ID'
+    value: ${{ steps.setup.outputs.project_id }}
+  region:
+    description: 'Configured GCP Region'
+    value: ${{ steps.setup.outputs.region }}
+  zone:
+    description: 'Configured GCP Zone'
+    value: ${{ steps.setup.outputs.zone }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ============================================
+    # Authenticate to Google Cloud
+    # ============================================
+    - name: Authenticate to Google Cloud
+      id: auth
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ inputs.workload_identity_provider }}
+        service_account: ${{ inputs.service_account }}
+        token_format: 'access_token'
+        access_token_lifetime: '3600s'
+        create_credentials_file: true
+        export_environment_variables: true
+        cleanup_credentials: false
+
+    # ============================================
+    # Setup gcloud CLI
+    # ============================================
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        version: 'latest'
+        project_id: ${{ inputs.project_id }}
+        install_components: 'gcloud,gsutil,bq'
+
+    # ============================================
+    # Configure gcloud with project settings
+    # ============================================
+    - name: Configure gcloud
+      id: setup
+      shell: bash
+      run: |
+        echo "::group::Configure gcloud settings"
+        
+        # Set project configuration
+        gcloud config set project "${{ inputs.project_id }}"
+        gcloud config set compute/region "${{ inputs.region }}"
+        gcloud config set compute/zone "${{ inputs.zone }}"
+        
+        # Verify authentication
+        echo "Authenticated as:"
+        gcloud auth list
+        
+        echo "Current project:"
+        gcloud config get-value project
+        
+        # Set outputs
+        echo "project_id=${{ inputs.project_id }}" >> $GITHUB_OUTPUT
+        echo "region=${{ inputs.region }}" >> $GITHUB_OUTPUT
+        echo "zone=${{ inputs.zone }}" >> $GITHUB_OUTPUT
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Configure Docker for Artifact Registry
+    # ============================================
+    - name: Configure Docker for Artifact Registry
+      if: inputs.setup_docker == 'true'
+      shell: bash
+      run: |
+        echo "::group::Configure Docker for Artifact Registry"
+        
+        # Configure Docker to use gcloud as credential helper
+        gcloud auth configure-docker ${{ inputs.region }}-docker.pkg.dev --quiet
+        
+        echo "Docker configured for Artifact Registry in ${{ inputs.region }}"
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Install GKE authentication plugin (optional)
+    # ============================================
+    - name: Install GKE Auth Plugin
+      if: inputs.install_gke_auth == 'true'
+      shell: bash
+      run: |
+        echo "::group::Install GKE Auth Plugin"
+        
+        gcloud components install gke-gcloud-auth-plugin --quiet
+        
+        echo "GKE authentication plugin installed"
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Validate setup
+    # ============================================
+    - name: Validate GCP Setup
+      shell: bash
+      run: |
+        echo "::group::Validate GCP Setup"
+        
+        echo "✓ Project ID: $(gcloud config get-value project)"
+        echo "✓ Region: $(gcloud config get-value compute/region)"
+        echo "✓ Zone: $(gcloud config get-value compute/zone)"
+        echo "✓ Account: $(gcloud config get-value account)"
+        
+        # Test API access
+        echo ""
+        echo "Testing API access..."
+        if gcloud projects describe "${{ inputs.project_id }}" &>/dev/null; then
+          echo "✓ Successfully accessed project metadata"
+        else
+          echo "✗ Failed to access project metadata"
+          exit 1
+        fi
+        
+        echo "::endgroup::"
+
+    # ============================================
+    # Display summary
+    # ============================================
+    - name: Display Setup Summary
+      shell: bash
+      run: |
+        echo "### GCP Setup Complete ✓" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Project ID | \`${{ inputs.project_id }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Region | \`${{ inputs.region }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Zone | \`${{ inputs.zone }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Service Account | \`${{ inputs.service_account }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Docker Setup | \`${{ inputs.setup_docker }}\` |" >> $GITHUB_STEP_SUMMARY

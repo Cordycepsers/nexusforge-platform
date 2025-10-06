@@ -1,0 +1,496 @@
+name: 06 - Backup Automation
+
+on:
+  schedule:
+    # Run daily at 3 AM UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      backup_type:
+        description: 'Type of backup to perform'
+        required: true
+        type: choice
+        options:
+          - all
+          - database
+          - secrets
+          - configuration
+        default: 'all'
+      environment:
+        description: 'Environment to backup'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+          - all
+        default: 'all'
+      retention_days:
+        description: 'Backup retention in days'
+        required: false
+        type: number
+        default: 30
+
+env:
+  REGION: us-central1
+  BACKUP_BUCKET: nexusforge-backups
+
+jobs:
+  # ============================================
+  # Initialize backup
+  # ============================================
+  initialize:
+    name: Initialize Backup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      backup_id: ${{ steps.id.outputs.value }}
+      timestamp: ${{ steps.time.outputs.value }}
+      environments: ${{ steps.env.outputs.list }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Generate Backup ID
+        id: id
+        run: |
+          BACKUP_ID="backup-$(date +%Y%m%d-%H%M%S)-${{ github.run_number }}"
+          echo "value=${BACKUP_ID}" >> $GITHUB_OUTPUT
+          echo "Backup ID: ${BACKUP_ID}"
+
+      - name: Set Timestamp
+        id: time
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "value=${TIMESTAMP}" >> $GITHUB_OUTPUT
+          echo "Timestamp: ${TIMESTAMP}"
+
+      - name: Determine Environments
+        id: env
+        run: |
+          ENV="${{ inputs.environment }}"
+          if [ -z "$ENV" ] || [ "$ENV" == "all" ]; then
+            ENV="dev,staging,prod"
+          fi
+          echo "list=${ENV}" >> $GITHUB_OUTPUT
+          echo "Environments: ${ENV}"
+
+      - name: Ensure Backup Bucket Exists
+        run: |
+          if ! gsutil ls "gs://${{ env.BACKUP_BUCKET }}" &>/dev/null; then
+            echo "Creating backup bucket..."
+            gsutil mb -p "${{ secrets.GCP_PROJECT_ID }}" \
+              -l "${{ env.REGION }}" \
+              "gs://${{ env.BACKUP_BUCKET }}"
+            
+            # Set lifecycle policy to delete old backups
+            cat > lifecycle.json <<EOF
+          {
+            "lifecycle": {
+              "rule": [
+                {
+                  "action": {"type": "Delete"},
+                  "condition": {"age": ${{ inputs.retention_days || 30 }}}
+                }
+              ]
+            }
+          }
+          EOF
+            
+            gsutil lifecycle set lifecycle.json "gs://${{ env.BACKUP_BUCKET }}"
+            echo "✓ Backup bucket created"
+          else
+            echo "✓ Backup bucket exists"
+          fi
+
+  # ============================================
+  # Backup Cloud SQL databases
+  # ============================================
+  backup-databases:
+    name: Backup Databases
+    if: inputs.backup_type == 'all' || inputs.backup_type == 'database' || github.event_name == 'schedule'
+    needs: initialize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        environment: ${{ fromJson(format('["{0}"]', needs.initialize.outputs.environments)) }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Check Cloud SQL Instance
+        id: check
+        continue-on-error: true
+        run: |
+          INSTANCE_NAME="nexusforge-db-${{ matrix.environment }}"
+          
+          if gcloud sql instances describe "$INSTANCE_NAME" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "instance=${INSTANCE_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Cloud SQL instance not found: ${INSTANCE_NAME}"
+          fi
+
+      - name: Create Database Backup
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          BACKUP_ID="${{ needs.initialize.outputs.backup_id }}-${{ matrix.environment }}"
+          INSTANCE="${{ steps.check.outputs.instance }}"
+          
+          echo "Creating backup for ${INSTANCE}..."
+          
+          # Create on-demand backup
+          gcloud sql backups create \
+            --instance "$INSTANCE" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --description "Automated backup: ${BACKUP_ID}"
+          
+          # Export to Cloud Storage
+          EXPORT_URI="gs://${{ env.BACKUP_BUCKET }}/databases/${{ matrix.environment }}/${BACKUP_ID}.sql"
+          
+          gcloud sql export sql "$INSTANCE" "$EXPORT_URI" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --database=nexusforge
+          
+          echo "✓ Database backup complete: ${EXPORT_URI}"
+          
+          echo "## Database Backup: ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Instance:** ${INSTANCE}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Location:** ${EXPORT_URI}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp:** ${{ needs.initialize.outputs.timestamp }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Backup Redis Data
+        if: steps.check.outputs.exists == 'true'
+        continue-on-error: true
+        run: |
+          BACKUP_ID="${{ needs.initialize.outputs.backup_id }}-${{ matrix.environment }}"
+          REDIS_INSTANCE="nexusforge-redis-${{ matrix.environment }}"
+          
+          if gcloud redis instances describe "$REDIS_INSTANCE" \
+            --region "${{ env.REGION }}" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" &>/dev/null; then
+            
+            echo "Creating Redis backup for ${REDIS_INSTANCE}..."
+            
+            # Create snapshot export
+            EXPORT_URI="gs://${{ env.BACKUP_BUCKET }}/redis/${{ matrix.environment }}/${BACKUP_ID}.rdb"
+            
+            gcloud redis instances export "$REDIS_INSTANCE" \
+              "$EXPORT_URI" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}"
+            
+            echo "✓ Redis backup complete: ${EXPORT_URI}"
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Redis Backup" >> $GITHUB_STEP_SUMMARY
+            echo "- **Instance:** ${REDIS_INSTANCE}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Location:** ${EXPORT_URI}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Redis instance not found, skipping..."
+          fi
+
+  # ============================================
+  # Backup secrets
+  # ============================================
+  backup-secrets:
+    name: Backup Secrets
+    if: inputs.backup_type == 'all' || inputs.backup_type == 'secrets' || github.event_name == 'schedule'
+    needs: initialize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        environment: ${{ fromJson(format('["{0}"]', needs.initialize.outputs.environments)) }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: List and Backup Secrets
+        run: |
+          BACKUP_ID="${{ needs.initialize.outputs.backup_id }}"
+          BACKUP_DIR="secrets/${{ matrix.environment }}/${BACKUP_ID}"
+          
+          echo "Backing up secrets for ${{ matrix.environment }}..."
+          
+          # List all secrets for this environment
+          SECRETS=$(gcloud secrets list \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --filter "labels.environment=${{ matrix.environment }}" \
+            --format "value(name)" || echo "")
+          
+          if [ -z "$SECRETS" ]; then
+            echo "No secrets found for ${{ matrix.environment }}"
+            exit 0
+          fi
+          
+          # Create metadata file
+          mkdir -p secrets-backup
+          cat > secrets-backup/metadata.json <<EOF
+          {
+            "backup_id": "${BACKUP_ID}",
+            "environment": "${{ matrix.environment }}",
+            "timestamp": "${{ needs.initialize.outputs.timestamp }}",
+            "secrets": []
+          }
+          EOF
+          
+          # Export secret metadata (not values)
+          echo "$SECRETS" | while read -r SECRET_NAME; do
+            if [ -n "$SECRET_NAME" ]; then
+              echo "Processing secret: ${SECRET_NAME}"
+              
+              # Get secret metadata
+              gcloud secrets describe "$SECRET_NAME" \
+                --project "${{ secrets.GCP_PROJECT_ID }}" \
+                --format json > "secrets-backup/${SECRET_NAME}.json"
+              
+              # Add to metadata
+              jq --arg name "$SECRET_NAME" \
+                '.secrets += [{"name": $name, "backed_up": true}]' \
+                secrets-backup/metadata.json > secrets-backup/metadata.tmp
+              mv secrets-backup/metadata.tmp secrets-backup/metadata.json
+            fi
+          done
+          
+          # Upload to Cloud Storage
+          gsutil -m cp -r secrets-backup/* \
+            "gs://${{ env.BACKUP_BUCKET }}/${BACKUP_DIR}/"
+          
+          echo "✓ Secrets metadata backup complete"
+          
+          echo "## Secrets Backup: ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Location:** gs://${{ env.BACKUP_BUCKET }}/${BACKUP_DIR}/" >> $GITHUB_STEP_SUMMARY
+          echo "- **Secrets Count:** $(echo "$SECRETS" | wc -l)" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # Backup configuration
+  # ============================================
+  backup-configuration:
+    name: Backup Configuration
+    if: inputs.backup_type == 'all' || inputs.backup_type == 'configuration' || github.event_name == 'schedule'
+    needs: initialize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        environment: ${{ fromJson(format('["{0}"]', needs.initialize.outputs.environments)) }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Backup Cloud Run Configurations
+        run: |
+          BACKUP_ID="${{ needs.initialize.outputs.backup_id }}"
+          BACKUP_DIR="config/${{ matrix.environment }}/${BACKUP_ID}"
+          
+          mkdir -p config-backup
+          
+          echo "Backing up Cloud Run configurations for ${{ matrix.environment }}..."
+          
+          SERVICES=("python" "node" "go")
+          
+          for service in "${SERVICES[@]}"; do
+            SERVICE_NAME="nexusforge-${service}-${{ matrix.environment }}"
+            
+            if gcloud run services describe "$SERVICE_NAME" \
+              --region "${{ env.REGION }}" \
+              --project "${{ secrets.GCP_PROJECT_ID }}" \
+              --format yaml > "config-backup/${SERVICE_NAME}.yaml" 2>/dev/null; then
+              echo "✓ Backed up ${SERVICE_NAME}"
+            fi
+          done
+          
+          # Backup VPC connector configuration
+          gcloud compute networks vpc-access connectors list \
+            --region "${{ env.REGION }}" \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --format yaml > config-backup/vpc-connectors.yaml || true
+          
+          # Backup firewall rules
+          gcloud compute firewall-rules list \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --format yaml > config-backup/firewall-rules.yaml || true
+          
+          # Upload to Cloud Storage
+          gsutil -m cp -r config-backup/* \
+            "gs://${{ env.BACKUP_BUCKET }}/${BACKUP_DIR}/"
+          
+          echo "✓ Configuration backup complete"
+          
+          echo "## Configuration Backup: ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Location:** gs://${{ env.BACKUP_BUCKET }}/${BACKUP_DIR}/" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # Backup verification
+  # ============================================
+  verify:
+    name: Verify Backups
+    needs: [initialize, backup-databases, backup-secrets, backup-configuration]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Verify Backup Integrity
+        run: |
+          BACKUP_ID="${{ needs.initialize.outputs.backup_id }}"
+          
+          echo "Verifying backup: ${BACKUP_ID}"
+          
+          # List all files in backup
+          gsutil ls -r "gs://${{ env.BACKUP_BUCKET }}/**/${BACKUP_ID}*" > backup-files.txt || true
+          
+          if [ -s backup-files.txt ]; then
+            FILE_COUNT=$(wc -l < backup-files.txt)
+            echo "✓ Found ${FILE_COUNT} backup files"
+            
+            # Calculate total size
+            TOTAL_SIZE=$(gsutil du -s "gs://${{ env.BACKUP_BUCKET }}/" | awk '{print $1}')
+            SIZE_MB=$((TOTAL_SIZE / 1024 / 1024))
+            
+            echo "## Backup Verification" >> $GITHUB_STEP_SUMMARY
+            echo "- **Backup ID:** ${BACKUP_ID}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Files:** ${FILE_COUNT}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Total Size:** ${SIZE_MB} MB" >> $GITHUB_STEP_SUMMARY
+            echo "- **Status:** ✅ Complete" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "::error::No backup files found"
+            exit 1
+          fi
+
+  # ============================================
+  # Cleanup old backups
+  # ============================================
+  cleanup:
+    name: Cleanup Old Backups
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup GCP
+        uses: ./.github/actions/setup-gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          region: ${{ env.REGION }}
+
+      - name: Remove Expired Backups
+        run: |
+          RETENTION_DAYS=${{ inputs.retention_days || 30 }}
+          
+          echo "Removing backups older than ${RETENTION_DAYS} days..."
+          
+          # Note: This is handled by the bucket lifecycle policy,
+          # but we can also do manual cleanup
+          
+          CUTOFF_DATE=$(date -u -d "${RETENTION_DAYS} days ago" +%Y%m%d)
+          
+          # List and remove old Cloud SQL backups
+          gcloud sql backups list \
+            --instance nexusforge-db-prod \
+            --project "${{ secrets.GCP_PROJECT_ID }}" \
+            --format json | \
+            jq -r ".[] | select(.windowStartTime < \"${CUTOFF_DATE}\") | .id" | \
+            while read -r BACKUP_ID; do
+              if [ -n "$BACKUP_ID" ]; then
+                echo "Deleting old backup: ${BACKUP_ID}"
+                gcloud sql backups delete "$BACKUP_ID" \
+                  --instance nexusforge-db-prod \
+                  --project "${{ secrets.GCP_PROJECT_ID }}" \
+                  --quiet || true
+              fi
+            done
+          
+          echo "✓ Cleanup complete"
+
+  # ============================================
+  # Final summary
+  # ============================================
+  notify:
+    name: Backup Summary
+    needs: [initialize, backup-databases, backup-secrets, backup-configuration, verify, cleanup]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## 💾 Backup Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Backup Status" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backup ID:** ${{ needs.initialize.outputs.backup_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp:** ${{ needs.initialize.outputs.timestamp }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Databases:** ${{ needs.backup-databases.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Secrets:** ${{ needs.backup-secrets.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Configuration:** ${{ needs.backup-configuration.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Verification:** ${{ needs.verify.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cleanup:** ${{ needs.cleanup.result }}" >> $GITHUB_STEP_SUMMARY
